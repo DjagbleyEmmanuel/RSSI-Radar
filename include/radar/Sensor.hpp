@@ -214,6 +214,9 @@ class WifiRadiometricSensor : public ISensor {
     // Bring the saved wireless profile back up and wait for a real associated
     // channel. Returns the channel, or 0 if the band could not be resolved.
     int forceReassociate();
+    // Record the network this interface is on now, so exactly that one can be
+    // rejoined later. Never activates a profile on its own.
+    void rememberCurrentNetwork();
     // Run a command needing real root, escalating through pkexec when the
     // process is not root.
     bool runPrivileged(const std::string& cmd, std::string* out);
@@ -249,6 +252,10 @@ class WifiRadiometricSensor : public ISensor {
     bool monitorMode_ = false;
     bool nmStopped_ = false;
     bool nmReleased_ = false;   // device handed back via `nmcli ... managed no`
+    // The network this interface was associated with at start-up. Only this one
+    // is ever reconnected.
+    std::string savedProfile_;
+    std::string savedSsid_;
     int autoChannel_ = 0;
     double sampleRate_ = 100.0;
 

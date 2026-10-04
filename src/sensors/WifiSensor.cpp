@@ -331,6 +331,10 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     //
     // Do this *after* reclaiming, so a stale monitor interface from a crashed
     // run is cleaned up before anything else touches the device.
+    // Recorded first: after this point the interface is taken out of managed
+    // mode and the association is gone, so there is no second chance to learn
+    // which network we were on.
+    rememberCurrentNetwork();
     reclaimStaleInterfaces();
 
     // Resolve the channel to listen on *while NetworkManager is still running*.
@@ -368,9 +372,25 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     }
 
     if (autoChannel_ <= 0) {
-        if (err) *err =
-            "could not determine a WiFi channel to listen on; the interface is not "
-            "associated with any network. Connect to a network and try again.";
+        // Distinguish "not joined to anything" from "NetworkManager has lost
+        // track of the adapter". The second needs root to fix, so saying so is
+        // the difference between a user who can fix it in one command and one
+        // who goes hunting through the network stack.
+        std::string known;
+        runCapture("nmcli -t -f GENERAL.DEVICE device show", &known);
+        const bool nmSeesDevice = known.find(iface_) != std::string::npos;
+        if (err) {
+            if (!nmSeesDevice)
+                *err = "NetworkManager no longer knows about " + iface_ +
+                       ". This happens when the service was stopped outside this "
+                       "program; it cannot be repaired without root. Run:\n"
+                       "    sudo systemctl restart NetworkManager\n"
+                       "then reconnect to your network and start again.";
+            else
+                *err = "could not determine a WiFi channel to listen on; " + iface_ +
+                       " is not associated with any network. Connect to a network "
+                       "and start again.";
+        }
         reason_ = UnavailableReason::NotPresent;
         restoreNetworkManager();   // never leave the device released on failure
         return false;
@@ -1333,59 +1353,121 @@ void WifiRadiometricSensor::reclaimStaleInterfaces() {
     // until it does, `iw dev info` reports no channel at all. Without a channel
     // the synthesiser cannot be pinned and the capture silently listens to
     // channel 1, which is the exact failure this whole path exists to prevent.
-    // So the saved wireless profile is brought up explicitly.
+    // Waiting here is only for the type change to land, not for a channel: the
+    // association and the channel are forceReassociate()'s job, and waiting for
+    // a channel that will never appear on an empty band just burned six seconds
+    // on every start.
+    for (int i = 0; i < 10; ++i) {
+        std::string state;
+        runCapture("iw dev " + iface_ + " info", &state);
+        if (state.find("type managed") != std::string::npos) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+
+    // So the network this interface was on is brought back explicitly -- and
+    // only that one. See forceReassociate().
+    if (savedProfile_.empty()) rememberCurrentNetwork();
     forceReassociate();
 }
 
 // Bring the saved wireless connection back up and wait until the interface
 // genuinely reports an associated channel. Returns the channel, or 0.
+// Record which network this interface is on *before* anything is changed, so the
+// connection can be handed back to exactly that one on exit.
+void WifiRadiometricSensor::rememberCurrentNetwork() {
+    savedProfile_.clear();
+    savedSsid_.clear();
+
+    // The SSID the radio is actually associated with.
+    std::string info;
+    runCapture("iw dev " + iface_ + " info", &info);
+    const size_t s = info.find("ssid ");
+    if (s != std::string::npos) {
+        size_t e = info.find('\n', s);
+        if (e == std::string::npos) e = info.size();
+        savedSsid_ = info.substr(s + 5, e - s - 5);
+        while (!savedSsid_.empty() && std::isspace(static_cast<unsigned char>(savedSsid_.back())))
+            savedSsid_.pop_back();
+    }
+
+    // The profile NetworkManager currently has active on this device.
+    std::string active;
+    runCapture("nmcli -t -f NAME,DEVICE connection show --active", &active);
+    std::istringstream as(active);
+    std::string row;
+    while (std::getline(as, row)) {
+        const size_t c1 = row.find(':');
+        if (c1 == std::string::npos) continue;
+        // The device column is last, so a row can legitimately contain only one
+        // separator: "My Home Network:wlp3s0". Treating a missing second colon
+        // as "malformed" skipped every single-column row, which is most of them,
+        // and left the app with no preferred network to rejoin.
+        const size_t c2 = row.find(':', c1 + 1);
+        const std::string dev =
+            c2 == std::string::npos ? row.substr(c1 + 1) : row.substr(c1 + 1, c2 - c1 - 1);
+        if (dev != iface_) continue;
+        savedProfile_ = row.substr(0, c1);
+        break;
+    }
+
+    if (!savedProfile_.empty()) note("connected network: " + savedProfile_);
+    else if (!savedSsid_.empty()) note("associated with \"" + savedSsid_ + "\" (no active profile)");
+    else note("no associated network recorded");
+}
+
+// Re-establish the association, and return the channel.
+//
+// This deliberately never activates an arbitrary saved profile. It used to take
+// whichever 802.11 profile happened to be first in the nmcli list and run
+// `nmcli con up` on it, which meant that starting the radar could spend twenty
+// seconds trying to authenticate to a network the user had not touched in
+// years, and quitting could leave the machine switched onto it. Only the network
+// this interface was already on is ever reconnected.
 int WifiRadiometricSensor::forceReassociate() {
     if (iface_.empty()) return 0;
 
     runCapture("nmcli radio wifi on", nullptr);
 
-    // Pick a saved 802.11 profile and activate it.
-    std::string listing;
-    runCapture("nmcli -t -f NAME,TYPE connection show", &listing);
-    std::string profile;
-    std::istringstream ls(listing);
-    std::string row;
-    while (std::getline(ls, row)) {
-        if (row.find("802-11-wireless") == std::string::npos) continue;
-        const size_t colon = row.find(':');
-        if (colon == std::string::npos) continue;
-        profile = row.substr(0, colon);
-        break;
-    }
-    if (profile.empty()) {
-        // No saved profile: a scan is the only way to learn the channel.
-        runCapture("nmcli device wifi rescan", nullptr);
-    } else {
+    const bool haveProfile = !savedProfile_.empty();
+    if (haveProfile) {
         std::string ignored;
         // The profile name very often contains spaces ("My Home Network"), and
         // an unquoted name makes nmcli fail with "unknown connection", which
         // then looks exactly like an interface that will not reassociate.
-        runCapture("nmcli con up " + shellQuote(profile), &ignored);
+        runCapture("nmcli con up " + shellQuote(savedProfile_), &ignored);
+    } else {
+        // Nothing to reconnect to. Do not go fishing through the saved list --
+        // just let NetworkManager autoconnect to whatever it would have chosen,
+        // and scan so the channel can be learned.
+        runCapture("nmcli device wifi rescan", nullptr);
+        note("no previously active network to rejoin; scanning instead");
     }
 
-    for (int i = 0; i < 40; ++i) {  // up to 20s
+    // A profile that exists will associate in a second or two. With nothing
+    // targeted there is no reason to wait the full twenty seconds.
+    const int attempts = haveProfile ? 40 : 12;
+    for (int i = 0; i < attempts; ++i) {
         std::string info;
         runCapture("iw dev " + iface_ + " info", &info);
         const size_t k = info.find("channel ");
         if (info.find("type managed") != std::string::npos && k != std::string::npos) {
             const int ch = std::atoi(info.c_str() + k + 8);
             if (ch > 0) {
-                note("reassociated on channel " + std::to_string(ch));
+                note("reassociated on channel " + std::to_string(ch) +
+                     (haveProfile ? " on " + savedProfile_ : std::string()));
                 return ch;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
 
+    if (haveProfile) note("could not rejoin " + savedProfile_ + "; scanning");
+
     // Still nothing. Scan explicitly, which works in managed mode and is the
-    // last chance to learn the channel before NetworkManager is stopped.
+    // last chance to learn the channel before NetworkManager is released.
     const int scanned = findBestChannel();
-    if (scanned > 0) note("channel " + std::to_string(scanned) + " found by scan after reassociation gave up");
+    if (scanned > 0)
+        note("channel " + std::to_string(scanned) + " found by scan");
     return scanned;
 }
 

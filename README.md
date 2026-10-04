@@ -219,6 +219,37 @@ unquoted profile name, and a profile named `My Home Network` silently failed
 with "unknown connection", which is indistinguishable from a card that will not
 reassociate.
 
+### Joining a network, and not the wrong one
+
+On start-up the interface is released from NetworkManager so the channel can be
+pinned, which means the association is lost and has to be restored. The
+connection that is restored is **the one this interface was already on**, read
+from `nmcli connection show --active` before anything is changed.
+
+It used to be whichever saved 802.11 profile happened to be first in the nmcli
+list, activated with `nmcli con up`. On a machine with a few stale entries that
+meant start-up could spend twenty seconds authenticating to a network nobody had
+used in years, and quitting could leave the machine switched onto it. Now no
+profile is ever activated unless it is the one already in use; when there is no
+previous network the program scans for a channel instead of guessing, and gives
+up after a bounded six seconds rather than waiting out a full association cycle
+for a target it does not have.
+
+Starting with no network in range therefore fails in about ten seconds with
+
+```
+could not determine a WiFi channel to listen on; wlp3s0 is not associated
+with any network. Connect to a network and start again.
+```
+
+If instead NetworkManager has lost track of the adapter entirely -- which
+happens when the service was stopped outside this program, and cannot be
+repaired without root -- the error says so and names the command:
+
+```
+sudo systemctl restart NetworkManager
+```
+
 ### When the capture goes quiet
 
 A capture that stops delivering frames while the application stays responsive is
