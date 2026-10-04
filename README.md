@@ -8,6 +8,12 @@ generator, no simulated CSI, no fallback that invents a value. When a radio
 cannot deliver data the program says so explicitly instead of drawing a flat
 line and calling it science.
 
+![RSSI Radar sensing live traffic](docs/screenshot.png)
+
+*The main window during live capture: polar scope with tracked contacts, the
+detection waterfall with its adaptive threshold, received power with the running
+mean, and live telemetry. Transmitter addresses are omitted from this capture.*
+
 ---
 
 ## What your hardware can and cannot do
