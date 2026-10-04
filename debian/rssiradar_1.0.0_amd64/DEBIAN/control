@@ -1,0 +1,36 @@
+Package: rssiradar
+Version: 1.0.0
+Section: science
+Priority: optional
+Architecture: amd64
+Maintainer: RSSI Radar maintainer
+Depends: libc6 (>= 2.38), libgcc-s1 (>= 4.0), libqt6core6t64 (>= 6.4.0),
+ libqt6gui6t64 (>= 6.4.0), libqt6widgets6t64 (>= 6.1.2), libstdc++6 (>= 13.1),
+ libbluetooth3
+Recommends: iw, network-manager
+Suggests: tcpdump
+Installed-Size: 3400
+Section-Description: science
+Description:
+ Passive WiFi and Bluetooth radiometric motion sensing.
+ .
+ RSSI Radar senses motion passively using real raw sockets: AF_PACKET with
+ radiotap header parsing for WiFi, and an AF_BLUETOOTH HCI socket for LE
+ advertising reports. There is no simulated-data path in the program -- every
+ reported value derives from frames a real radio received, and hardware that
+ cannot deliver is reported explicitly rather than faked.
+ .
+ The signal chain is a log-distance path-loss inversion, Savitzky-Golay
+ smoothing, adaptive CFAR with entropy and chi-square change detection,
+ extended Kalman and particle filters for state, and a Welch averaged
+ periodogram that converts the envelope beat frequency into radial velocity
+ via v = f_beat * lambda.
+ .
+ Eight operating presets ship with the program, from breath detection to
+ fast intrusion and strict laboratory baselines. Configuration is JSON and can
+ be saved and reloaded from the interface.
+ .
+ Note: switching the interface to monitor mode requires real root, because it
+ drives iw and NetworkManager over D-Bus. The package grants CAP_NET_RAW and
+ CAP_NET_ADMIN so that passive managed-mode capture and the hardware probe work
+ without it.

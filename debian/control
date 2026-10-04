@@ -1,0 +1,9 @@
+Source: rssiradar
+Section: science
+Priority: optional
+Maintainer: RSSI Radar maintainer
+Standards-Version: 4.6.2
+
+Package: rssiradar
+Architecture: any
+Description: passive radiometric motion sensing

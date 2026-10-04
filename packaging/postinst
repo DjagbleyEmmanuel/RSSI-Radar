@@ -1,0 +1,31 @@
+#!/bin/sh
+# RSSI Radar post-installation.
+#
+# Raw capture needs CAP_NET_RAW. Taking the two capabilities off the binary lets
+# the GUI open an AF_PACKET socket and read interface flags without root, which
+# is enough for managed-mode operation and for the hardware probe.
+#
+# Monitor mode still needs real root, because that path drives `iw` and
+# NetworkManager over D-Bus and polkit will not grant it to a merely-capability
+# binary. Documented in the README.
+set -e
+
+BIN="/usr/bin/rssiradar"
+
+if [ -x "$BIN" ]; then
+    # Deliberately a warning, not a hard failure: an install on a filesystem
+    # that does not support xattrs (some network mounts) should still succeed.
+    if ! setcap cap_net_raw,cap_net_admin+eip "$BIN" 2>/dev/null; then
+        echo "rssiradar: could not grant CAP_NET_RAW; run with sudo for capture." >&2
+    fi
+fi
+
+# Refresh the desktop/mime caches if they exist. Never fatal.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -q -f /usr/share/icons/hicolor || true
+fi
+
+exit 0

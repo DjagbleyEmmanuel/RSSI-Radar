@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=RSSI Radar
+GenericName=WiFi Radiometric Motion Sensing
+Comment=Passive WiFi/Bluetooth radiometric motion detection with real raw-socket capture
+Exec=rssiradar
+Icon=rssiradar
+Terminal=false
+Categories=Science;Network;Monitor;Utility;
+Keywords=wifi;bluetooth;rssi;rssi;radar;motion;presence;monitor;csi;
+StartupNotify=true

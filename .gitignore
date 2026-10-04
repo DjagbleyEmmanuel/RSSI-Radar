@@ -1,0 +1,42 @@
+# Build output
+build/
+build-asan/
+builddir/
+cmake-build-*/
+
+# Build artefacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+*.o
+*.a
+*.so
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+compile_commands.json
+
+# Packaged output
+*.deb
+*.rpm
+
+# Earlier standalone prototype, superseded by the C++/Qt6 application.
+# Kept on disk, deliberately out of history.
+rssi_radar_no_hotspot_v3.py
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# Compiled binary inside the packaging tree. It is produced by the build and
+# copied in before `dpkg-deb --build`; only its packaging metadata belongs here.
+debian/rssiradar_1.0.0_amd64/usr/bin/rssiradar
+debian/rssiradar_1.0.0_amd64/usr/share/doc/rssiradar/README.md.gz
+
+# Release artefacts (uploaded to GitHub Releases, not tracked)
+*.deb.sha256
