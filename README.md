@@ -219,6 +219,45 @@ unquoted profile name, and a profile named `My Home Network` silently failed
 with "unknown connection", which is indistinguishable from a card that will not
 reassociate.
 
+### Running with no network joined at all
+
+Monitor mode does **not** require an association. It requires a frequency.
+
+A monitor-mode interface receives every frame on its channel — beacons, probes,
+data — whether or not it is associated with anything. What it cannot do is
+*choose* a frequency on its own: with no association the firmware has no channel
+to be on, sits at the power-on default of channel 1, and hears nothing unless
+that happens to be where the traffic is.
+
+So the association has only ever been used as a **channel hint**. The program
+reads the channel from whatever network the interface was on and pins the
+synthesiser to it. When you configure a channel explicitly, that hint is
+unnecessary and the whole association step is skipped:
+
+```sh
+echo '{"radio":{"wifiChannel":6}}' > radar.json
+rssiradar --config radar.json
+```
+
+Measured with no network joined and no access point in range: the program enters
+monitor mode, reports `listening on channel 6 (configured)` and `card reports
+channel 6 (pinned)`, and runs. It observes nothing, correctly, because the band
+is empty — not because it is waiting for permission to listen.
+
+Two bugs made this harder than it needed to be and are fixed here:
+
+* `j.value("radio", nullptr)` made nlohmann deduce `ValueType = std::nullptr_t`
+  and throw "type must be null, but is object" for any **present** section, so
+  every partial configuration file was rejected and silently fell back to the
+  defaults. A file changing one setting could not be loaded at all.
+* The caller swallowed that error, so `--config` appeared to work when nothing
+  had been applied. It now reports the parse failure and continues on defaults.
+
+If you do not know which channel to listen on, either associate once so the
+channel can be read, or let the program scan for it. Hopping across a list of
+channels is not implemented; it would raise the cost per channel dwell and needs
+the sample rate accounted for, which this version does not yet do.
+
 ### Joining a network, and not the wrong one
 
 On start-up the interface is released from NetworkManager so the channel can be

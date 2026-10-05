@@ -256,6 +256,8 @@ class WifiRadiometricSensor : public ISensor {
     // is ever reconnected.
     std::string savedProfile_;
     std::string savedSsid_;
+    // The channel is pinned by configuration, so no association is needed.
+    bool channelAlreadyKnown_ = false;
     int autoChannel_ = 0;
     double sampleRate_ = 100.0;
 

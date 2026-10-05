@@ -331,10 +331,14 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     //
     // Do this *after* reclaiming, so a stale monitor interface from a crashed
     // run is cleaned up before anything else touches the device.
+    // A configured channel removes the only reason to associate at all: monitor
+    // mode does not require a network, it requires a frequency.
+    channelAlreadyKnown_ = cfg.radio.wifiChannel > 0;
+
     // Recorded first: after this point the interface is taken out of managed
     // mode and the association is gone, so there is no second chance to learn
     // which network we were on.
-    rememberCurrentNetwork();
+    if (!channelAlreadyKnown_) rememberCurrentNetwork();
     reclaimStaleInterfaces();
 
     // Resolve the channel to listen on *while NetworkManager is still running*.
@@ -1364,10 +1368,18 @@ void WifiRadiometricSensor::reclaimStaleInterfaces() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
-    // So the network this interface was on is brought back explicitly -- and
-    // only that one. See forceReassociate().
-    if (savedProfile_.empty()) rememberCurrentNetwork();
-    forceReassociate();
+    // No need to rejoin anything when the channel is already pinned by
+    // configuration. Associating is only ever necessary to *learn* a channel,
+    // and that has already been answered, so waiting for an association here
+    // just added the full timeout to every start with no network in range.
+    if (!channelAlreadyKnown_) {
+        // Rejoin the network this interface was on -- and only that one. See
+        // forceReassociate().
+        if (savedProfile_.empty()) rememberCurrentNetwork();
+        forceReassociate();
+    } else {
+        note("channel configured, so no network association is needed");
+    }
 }
 
 // Bring the saved wireless connection back up and wait until the interface

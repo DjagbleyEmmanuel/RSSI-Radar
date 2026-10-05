@@ -158,6 +158,22 @@ FusionConfig fromJ(const json& j, const FusionConfig& d) {
     return c;
 }
 
+// Fetch an optional sub-object.
+//
+// `j.value("radio", nullptr)` does not work here: nlohmann deduces ValueType as
+// std::nullptr_t and then tries to extract it, which throws
+// "type must be null, but is object" whenever the key is present. The effect was
+// that *any* partial configuration file was rejected outright -- so
+// `--config` with just the one setting you wanted to change silently fell back
+// to the defaults. Since the error was swallowed by the caller, it looked like
+// the file had been applied.
+json sectionOf(const json& j, const char* key) {
+    if (!j.is_object()) return json();
+    const auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return json();
+    return *it;
+}
+
 json toJ(const RadioConfig& c) {
     return json{{"enableWifi", c.enableWifi},
                 {"enableBluetooth", c.enableBluetooth},
@@ -240,14 +256,14 @@ Config Config::fromJson(const json& j) {
     Config c;
     if (!j.is_null() && !j.is_object()) return c;
     c.presetName = j.value("presetName", c.presetName);
-    c.pathLoss = fromJ(j.value("pathLoss", nullptr), c.pathLoss);
-    c.window = fromJ(j.value("window", nullptr), c.window);
-    c.estimator = fromJ(j.value("estimator", nullptr), c.estimator);
-    c.spectral = fromJ(j.value("spectral", nullptr), c.spectral);
-    c.detector = fromJ(j.value("detector", nullptr), c.detector);
-    c.fusion = fromJ(j.value("fusion", nullptr), c.fusion);
-    c.radio = fromJ(j.value("radio", nullptr), c.radio);
-    c.ui = fromJ(j.value("ui", nullptr), c.ui);
+    c.pathLoss = fromJ(sectionOf(j, "pathLoss"), c.pathLoss);
+    c.window = fromJ(sectionOf(j, "window"), c.window);
+    c.estimator = fromJ(sectionOf(j, "estimator"), c.estimator);
+    c.spectral = fromJ(sectionOf(j, "spectral"), c.spectral);
+    c.detector = fromJ(sectionOf(j, "detector"), c.detector);
+    c.fusion = fromJ(sectionOf(j, "fusion"), c.fusion);
+    c.radio = fromJ(sectionOf(j, "radio"), c.radio);
+    c.ui = fromJ(sectionOf(j, "ui"), c.ui);
     c.anchors.clear();
     if (j.contains("anchors") && j["anchors"].is_array()) {
         for (const auto& a : j["anchors"]) {

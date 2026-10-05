@@ -169,7 +169,14 @@ int capture(double seconds, const QString& cfgPath) {
     if (!cfgPath.isEmpty()) {
         std::string err;
         const Config c = Config::load(cfgPath.toStdString(), &err);
-        if (err.empty()) engine.setConfig(c);
+        // The failure used to be swallowed: a rejected config file left the
+        // defaults in place with no message, so `--config pin.json` looked like
+        // it had been applied when the channel pin never happened.
+        if (!err.empty())
+            std::printf("WARNING: could not load %s (%s); using defaults\n",
+                        cfgPath.toStdString().c_str(), err.c_str());
+        else
+            engine.setConfig(c);
     }
     std::string err;
     if (!engine.start(&err)) {
