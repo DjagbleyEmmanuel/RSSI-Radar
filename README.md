@@ -219,6 +219,39 @@ unquoted profile name, and a profile named `My Home Network` silently failed
 with "unknown connection", which is indistinguishable from a card that will not
 reassociate.
 
+### Finding a transmitter by itself
+
+Monitor mode needs a frequency, not a network. Rather than making you associate
+with something so the channel can be read, the program sweeps the 2.4 GHz band
+and pins whichever channel is carrying traffic.
+
+Channels are visited non-overlapping-first — 1, 6, 11, then the rest — because
+those three bleed least into each other and give the fastest answer when one
+strong network is nearby. Each channel gets a settle period before counting, so a
+channel is not credited with the previous one's traffic.
+
+```
+band sweep: 1:0 6:0 11:0 2:0 7:0 12:0 3:0 8:0 13:0 4:0 9:0 10:0 5:0
+  -> nothing transmitting on any channel; there is nothing to sense
+```
+
+That is a real measurement, taken on hardware with no network joined and no
+access point in range. A silent band is reported as a *result*, not a failure:
+without a transmitter there is no signal to reflect off a moving body, so no
+processing could produce a detection from it, and an empty graph would imply
+otherwise.
+
+You do not need to join a network for this to work. Anything transmitting in
+range is enough — a beaconing access point you have never connected to, a probe
+response, two devices talking. What is required is a transmitter, not an
+association.
+
+**Not implemented: channel hopping.** The sweep selects one channel and dwells
+there. A target on a quieter channel than the busiest will be missed. Multi-
+channel operation needs the dwell time folded into the sample rate the detector
+assumes; doing it without that would report a sample rate that is simply false,
+so it has been left out rather than fudged.
+
 ### Running with no network joined at all
 
 Monitor mode does **not** require an association. It requires a frequency.
