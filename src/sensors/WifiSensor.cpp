@@ -7,6 +7,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/netlink.h>
 
@@ -355,6 +356,12 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     }
     if (autoChannel_ <= 0) autoChannel_ = forceReassociate();
 
+    // A channel is only really known if configuration, an association or a scan
+    // supplied it. Monitor mode below parks on channel 1 purely so the radio has
+    // something to listen on; that placeholder must not be mistaken for an
+    // answer, or the sweep below never runs.
+    const bool needSweep = autoChannel_ <= 0;
+
     // Still nothing: the device is most likely sitting `unmanaged` -- left that
     // way by an earlier run that died between releasing it and handing it back.
     // That is exactly the kind of state this program is supposed to repair by
@@ -375,32 +382,6 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
         }
     }
 
-    if (autoChannel_ <= 0) {
-        // Distinguish "not joined to anything" from "NetworkManager has lost
-        // track of the adapter". The second needs root to fix, so saying so is
-        // the difference between a user who can fix it in one command and one
-        // who goes hunting through the network stack.
-        std::string known;
-        runCapture("nmcli -t -f GENERAL.DEVICE device show", &known);
-        const bool nmSeesDevice = known.find(iface_) != std::string::npos;
-        if (err) {
-            if (!nmSeesDevice)
-                *err = "NetworkManager no longer knows about " + iface_ +
-                       ". This happens when the service was stopped outside this "
-                       "program; it cannot be repaired without root. Run:\n"
-                       "    sudo systemctl restart NetworkManager\n"
-                       "then reconnect to your network and start again.";
-            else
-                *err = "could not determine a WiFi channel to listen on; " + iface_ +
-                       " is not associated with any network. Connect to a network "
-                       "and start again.";
-        }
-        reason_ = UnavailableReason::NotPresent;
-        restoreNetworkManager();   // never leave the device released on failure
-        return false;
-    }
-    note(std::string("listening on channel ") + std::to_string(autoChannel_) +
-         (cfg.radio.wifiChannel > 0 ? " (configured)" : " (from the associated network)"));
 
     // Free the synthesiser before pinning the channel.
     //
@@ -437,6 +418,10 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     }
 
     if (cfg.radio.autoMonitorMode && hasNetAdminPrivilege()) {
+        // With no channel resolved yet, sit on channel 1 so the capture thread
+        // is running and the band sweep has something to count. The sweep then
+        // moves the synthesiser and picks the productive channel.
+        if (autoChannel_ <= 0) autoChannel_ = 1;
         std::string report = "no attempt made";
         for (int attempt = 1; attempt <= 3; ++attempt) {
             // 0 means "read the channel from the associated access point", which
@@ -459,6 +444,44 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
         if (!monitorMode_) note("monitor mode unusable: " + report);
     }
 
+    // No channel from configuration, association or scan: sweep the band for
+    // traffic rather than demanding that a network be joined. A monitor-mode
+    // interface hears beaconing access points it has never joined, so this is
+    // what makes the radio usable with nothing but its own antenna.
+    if (needSweep) {
+        std::string sweepDetail;
+        const int found = sweepBand(260, &sweepDetail);
+        if (found > 0) autoChannel_ = found;
+    }
+
+    if (needSweep && autoChannel_ <= 0) {
+        // Distinguish "not joined to anything" from "NetworkManager has lost
+        // track of the adapter". The second needs root to fix, so saying so is
+        // the difference between a user who can fix it in one command and one
+        // who goes hunting through the network stack.
+        std::string known;
+        runCapture("nmcli -t -f GENERAL.DEVICE device show", &known);
+        const bool nmSeesDevice = known.find(iface_) != std::string::npos;
+        if (err) {
+            if (!nmSeesDevice)
+                *err = "NetworkManager no longer knows about " + iface_ +
+                       ". This happens when the service was stopped outside this "
+                       "program; it cannot be repaired without root. Run:\n"
+                       "    sudo systemctl restart NetworkManager\n"
+                       "then reconnect to your network and start again.";
+            else
+                *err = "could not determine a WiFi channel to listen on; " + iface_ +
+                       " is not associated with any network. Connect to a network "
+                       "and start again.";
+        }
+        reason_ = UnavailableReason::NotPresent;
+        restoreNetworkManager();   // never leave the device released on failure
+        return false;
+    }
+    note(std::string("listening on channel ") + std::to_string(autoChannel_) +
+         (cfg.radio.wifiChannel > 0 ? " (configured)"
+                                    : (swept_ ? " (found by band sweep)"
+                                              : " (from the associated network)")));
     // Open the packet socket only after the mode switch and the final link-up:
     // an AF_PACKET binding does not survive an interface type change or a down
     // transition, so a socket opened first is left attached to nothing.
@@ -1193,6 +1216,15 @@ void WifiRadiometricSensor::captureLoop() {
         }
 
         if (usable) {
+            // Attribute the frame to the channel currently pinned. The band
+            // sweep reads these counters to decide where the traffic is, and it
+            // needs every frame counted, including ones that are not usable.
+            {
+                const int ch = currentChannel_.load(std::memory_order_relaxed);
+                if (ch > 0 && ch < static_cast<int>(framesPerChannel_.size()))
+                    framesPerChannel_[static_cast<size_t>(ch)].fetch_add(1,
+                                                                        std::memory_order_relaxed);
+            }
             // Estimate the effective sample rate from the elapsed wall time.
             const auto el = std::chrono::duration<double>(obs.hostTime - wallStart).count();
             if (el > 1.0) {
@@ -1483,6 +1515,99 @@ int WifiRadiometricSensor::forceReassociate() {
     return scanned;
 }
 
+
+// Sweep the 2.4 GHz band and pin the channel carrying the most traffic.
+//
+// A monitor-mode interface receives every frame on its channel, so it does not
+// need to be associated with anything to hear a beaconing access point, a probe
+// response, or two devices talking. What it cannot do on its own is choose a
+// frequency: with no association the firmware sits at the power-on default and
+// hears nothing. So rather than requiring a network to be joined, this walks the
+// band, counts what arrives on each channel, and pins the busiest one.
+//
+// Channels are visited non-overlapping-first (1, 6, 11) then the rest, because
+// those three are the ones least likely to bleed into each other and so give the
+// fastest answer when there is one strong network nearby.
+//
+// Returns the chosen channel, or 0 if the whole band was silent. A silent band is
+// a real, reportable result rather than a fault: with nothing transmitting there
+// is nothing to sense, and no processing could produce a detection from it.
+int WifiRadiometricSensor::sweepBand(int dwellMs, std::string* detail) {
+    static const int kChannels[] = {1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 10, 5};
+    constexpr int kCount = static_cast<int>(sizeof(kChannels) / sizeof(kChannels[0]));
+    const int phy = phyIndexOf(iface_);
+
+    // A private socket for the sweep. The main capture socket is opened later,
+    // and an AF_PACKET binding does not survive the type change that got us here.
+    const int sfd = ::socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC, htons(ETH_P_ALL));
+    if (sfd < 0) {
+        note("band sweep: could not open a socket for the sweep");
+        return 0;
+    }
+    sockaddr_ll sll{};
+    sll.sll_family = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex = static_cast<int>(::if_nametoindex(iface_.c_str()));
+    if (::bind(sfd, reinterpret_cast<sockaddr*>(&sll), sizeof(sll)) != 0) {
+        ::close(sfd);
+        note("band sweep: could not bind a socket to " + iface_);
+        return 0;
+    }
+
+    std::string tally;
+    int best = 0;
+    uint64_t bestFrames = 0;
+
+    if (phy >= 0) {
+        for (int i = 0; i < kCount; ++i) {
+            const int ch = kChannels[i];
+            currentChannel_.store(ch, std::memory_order_relaxed);
+            if (nl80211SetChannel(phy, ch) != 0) continue;
+
+            // Settle on the synthesiser, then count. Counting from the first
+            // millisecond would credit the previous channel's dwell to this one.
+            std::this_thread::sleep_for(std::chrono::milliseconds(dwellMs / 3));
+            uint64_t n = 0;
+            const auto until = Clock::now() + std::chrono::milliseconds(dwellMs);
+            while (Clock::now() < until) {
+                uint8_t buf[2048];
+                const auto untilPoll = std::min(Clock::now() + std::chrono::milliseconds(15), until);
+                while (Clock::now() < untilPoll) {
+                    const ssize_t r = ::recv(sfd, buf, sizeof(buf), MSG_DONTWAIT);
+                    if (r > 0) ++n;
+                    else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+
+            if (!tally.empty()) tally += " ";
+            tally += std::to_string(ch) + ":" + std::to_string(n);
+            if (n > bestFrames) {
+                bestFrames = n;
+                best = ch;
+            }
+        }
+    }
+
+    ::close(sfd);
+    currentChannel_.store(0, std::memory_order_relaxed);
+    swept_ = true;
+    sweptBest_ = best;
+    if (best > 0 && phy >= 0) {
+        nl80211SetChannel(phy, best);
+        currentChannel_.store(best, std::memory_order_relaxed);
+        autoChannel_ = best;
+    }
+
+    std::string msg = "band sweep: " + tally;
+    if (best > 0)
+        msg += " -> pinned channel " + std::to_string(best) + " (" +
+               std::to_string(bestFrames) + " frames on it)";
+    else
+        msg += " -> nothing transmitting on any channel; there is nothing to sense";
+    note(msg);
+    if (detail) *detail = msg;
+    return best;
+}
 
 bool WifiRadiometricSensor::repinChannel() {
     if (autoChannel_ <= 0) return false;

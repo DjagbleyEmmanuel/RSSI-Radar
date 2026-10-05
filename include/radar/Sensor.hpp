@@ -6,6 +6,7 @@
 // just with the csi field actually populated.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -235,6 +236,11 @@ class WifiRadiometricSensor : public ISensor {
     // Re-pin the synthesiser to the target channel, which is what silently
     // breaks when the access point roams to another channel.
     bool repinChannel();
+    // Sweep the 2.4 GHz band counting frames on each channel, and pin the most
+    // productive one. This is what removes the need for an association: monitor
+    // mode does not need to be joined to anything, it only needs a frequency,
+    // and a sweep finds a frequency with traffic on it.
+    int sweepBand(int dwellMs, std::string* detail);
 
     int fd_ = -1;
     std::thread thread_;
@@ -258,6 +264,14 @@ class WifiRadiometricSensor : public ISensor {
     std::string savedSsid_;
     // The channel is pinned by configuration, so no association is needed.
     bool channelAlreadyKnown_ = false;
+
+    // Band sweep state. currentChannel_ is the channel the synthesiser is
+    // currently pinned to; the capture thread attributes every parsed frame to
+    // it, which is how the sweep learns where the traffic is.
+    std::atomic<int> currentChannel_{0};
+    std::array<std::atomic<uint64_t>, 16> framesPerChannel_{};
+    bool swept_ = false;
+    int sweptBest_ = 0;
     int autoChannel_ = 0;
     double sampleRate_ = 100.0;
 
