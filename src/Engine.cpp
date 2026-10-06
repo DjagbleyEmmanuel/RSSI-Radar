@@ -76,6 +76,7 @@ Engine::Engine() {
     cfg_ = Config{};
     presetName_ = cfg_.presetName;
     detector_.configure(cfg_.detector);
+    configureDerivedDetectors();
     pathLoss_ = PathLossModel{cfg_.pathLoss.referenceDistanceM, cfg_.pathLoss.rssiAtRefDbm,
                               cfg_.pathLoss.pathLossExponent, cfg_.pathLoss.shadowSigmaDb};
     ekf_.reset();
@@ -94,6 +95,7 @@ void Engine::setConfig(const Config& cfg) {
     cfg_ = cfg.validated();
     presetName_ = cfg_.presetName;
     detector_.configure(cfg_.detector);
+    configureDerivedDetectors();
     pathLoss_ = PathLossModel{cfg_.pathLoss.referenceDistanceM, cfg_.pathLoss.rssiAtRefDbm,
                               cfg_.pathLoss.pathLossExponent, cfg_.pathLoss.shadowSigmaDb};
     ekf_.setProcessNoise(cfg_.estimator.processNoiseAccel);
@@ -219,6 +221,9 @@ void Engine::resetTracking() {
     decimationCounter_ = 0;
     lastBeat_ = 0.0;
     velocityPeakLatched_ = false;
+    life_.reset();
+    direction_.reset();
+    signatures_.clear();
 }
 
 void Engine::ingest(const Observation& o) {
@@ -542,6 +547,29 @@ void Engine::tick() {
         if (!starve.empty()) snap_.starveReason = starve;
     }
 
+    // --- Life sign and direction, fed from the primary transmitter's own
+    // observations. Both need the association-relative history, so they run here
+    // rather than in the capture path.
+    {
+        std::lock_guard<std::mutex> lk(trackMtx_);
+        if (havePrimary_) {
+            const auto it = tracks_.find(macHash(primary));
+            if (it != tracks_.end() && it->second.count() > 0) {
+                const RssiTrack& t = it->second;
+                const double wall =
+                    std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+                if (cfg_.lifeSignEnabled)
+                    life_.push(t.mean(), wall);
+            }
+        }
+        std::vector<RssiTrack> live;
+        live.reserve(tracks_.size());
+        for (const auto& kv : tracks_)
+            if (kv.second.count() > 0) live.push_back(kv.second);
+        direction_.update(live, std::chrono::duration<double>(Clock::now().time_since_epoch())
+                                   .count());
+    }
+
     // --- Contact tracking and statistical analysis.
     //
     // Both run over the same per-transmitter histories the graphs use, so what
@@ -593,7 +621,24 @@ void Engine::tick() {
                 snap_.anomalyByLabel.emplace_back(label, rep);
             }
         }
+
+        // Life sign, evaluated on its own long window.
+        if (cfg_.lifeSignEnabled) {
+            const double fs = sampleRate_ > 1.0 ? sampleRate_ : 1.0;
+            snap_.lifeSign = life_.evaluate(fs);
+            const double want =
+                std::max(20.0, cfg_.lifeSignMinCycles / std::max(1e-6, cfg_.lifeSignMinHz));
+            snap_.lifeSignProgress = std::clamp(life_.heldSeconds() / want, 0.0, 1.0);
+        }
+
+        // Direction from how the transmitters changed together.
+        snap_.directionTransmitters = direction_.transmitterCount();
+        snap_.direction =
+            direction_.estimate(pathLoss_.rangeFromRssi(meanDbm), meanDbm);
     }
+
+    // A signature is recorded on every trip, so it can be compared later.
+    if (det.state == DetectionState::Present && velocityPeakLatched_) recordSignature();
 
     // Event log, carrying the range interval so a log line stands on its own.
     if (det.state == DetectionState::Present && !velocityPeakLatched_) {
@@ -648,6 +693,49 @@ void Engine::tick() {
         velocityPeakLatched_ = false;
     }
     snap_.events = events_;
+}
+
+void Engine::configureDerivedDetectors() {
+    LifeSignDetector::Config ls;
+    ls.minHz = cfg_.lifeSignMinHz;
+    ls.maxHz = cfg_.lifeSignMaxHz;
+    ls.minCycles = cfg_.lifeSignMinCycles;
+    ls.minStrength = cfg_.lifeSignMinStrength;
+    ls.maxRmsDb = cfg_.lifeSignMaxRmsDb;
+    life_.configure(ls);
+
+    DirectionEstimator::Config de;
+    de.minChangeDb = cfg_.directionMinChangeDb;
+    direction_.configure(de);
+
+    signatures_.configure(cfg_.signatureCapacity);
+}
+
+void Engine::recordSignature() {
+    if (!snap_.primarySamples.empty()) {
+        AnomalyReport rep = anomaly_.analyse(snap_.primarySamples, sampleRate_);
+        if (!rep.enoughData) return;
+        Signature sig;
+        sig.v[0] = rep.varianceRatio;
+        sig.v[1] = rep.spectralFlatness;
+        sig.v[2] = rep.shannonEntropyBits;
+        sig.v[3] = rep.dominantPeriodS;
+        sig.v[4] = rep.kurtosis;
+        sig.v[5] = rep.trendPerMinute;
+        sig.v[6] = static_cast<double>(rep.outlierCount);
+        sig.v[7] = rep.stdDbm;
+        sig.wallTime = std::chrono::duration<double>(Clock::now().time_since_epoch()).count();
+        sig.label = snap_.primaryLabel;
+        snap_.signature = sig;
+        snap_.signatureValid = sig.valid();
+        signatures_.add(sig);
+        snap_.signatureCount = signatures_.size();
+        Signature m;
+        double d = 1.0;
+        snap_.nearestValid = signatures_.nearest(sig, m, d);
+        snap_.nearest = m;
+        snap_.nearestDistance = d;
+    }
 }
 
 Snapshot Engine::snapshot() const {

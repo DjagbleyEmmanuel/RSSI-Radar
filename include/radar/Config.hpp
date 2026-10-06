@@ -96,6 +96,8 @@ struct DetectorConfig {
     double departSeconds = 2.5;
 };
 
+
+
 struct FusionConfig {
     // Inverse-variance weighting across radios.
     bool inverseVarianceWeighting = true;
@@ -147,6 +149,20 @@ struct UiConfig {
 };
 
 struct Config {
+
+    // Life-sign detection. The window is derived from minCycles and minHz, so a
+    // slower rate needs proportionally more history before anything is reported.
+        bool lifeSignEnabled = true;
+        double lifeSignMinHz = 0.08;
+        double lifeSignMaxHz = 0.5;
+        double lifeSignMinCycles = 3.0;
+        double lifeSignMinStrength = 0.42;
+        // Envelope RMS ceiling, in dB. Above this the periodicity is motion.
+        double lifeSignMaxRmsDb = 1.6;
+        // Minimum change, in dB, before a transmitter contributes to a direction.
+        double directionMinChangeDb = 1.2;
+        // How many signatures to keep for comparison.
+        size_t signatureCapacity = 32;
     PathLossConfig pathLoss;
     WindowConfig window;
     EstimatorConfig estimator;

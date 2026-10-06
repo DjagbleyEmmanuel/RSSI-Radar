@@ -156,6 +156,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     tracking_->setMinimumHeight(230);
     tabs->addTab(tracking_, QStringLiteral("Tracking"));
 
+    // Life sign, direction and the channel signature.
+    signature_ = new SignaturePanelWidget;
+    tabs->addTab(signature_, QStringLiteral("Signature"));
+
     auto* eventsBox = new QWidget;
     auto* evl = new QVBoxLayout(eventsBox);
     evl->setContentsMargins(6, 6, 6, 6);
@@ -566,6 +570,7 @@ void MainWindow::onTick() {
     tracks_->setSnapshot(s);
     if (timeline_) timeline_->setSnapshot(s);
     if (tracking_) tracking_->setSnapshot(s);
+    if (signature_) signature_->setSnapshot(s);
 
     scope_->setShowGrid(gridChk_->isChecked());
     scope_->setShowTrails(trailsChk_->isChecked());

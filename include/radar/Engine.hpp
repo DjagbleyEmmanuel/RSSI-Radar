@@ -9,8 +9,11 @@
 
 #include "radar/Anomaly.hpp"
 #include "radar/Config.hpp"
+#include "radar/Direction.hpp"
 #include "radar/Dsp.hpp"
+#include "radar/LifeSign.hpp"
 #include "radar/Sensor.hpp"
+#include "radar/Signature.hpp"
 #include "radar/Tracker.hpp"
 
 namespace radar {
@@ -69,6 +72,23 @@ struct Snapshot {
     // Tracked contacts with stable ids, ranges and disappearance timeouts.
     std::vector<Contact> contacts;
     uint64_t contactsCreated = 0;
+
+    // Life-sign: a long-window look for respiration in the envelope.
+    LifeSignReport lifeSign;
+    double lifeSignProgress = 0.0;  // 0..1, how full the analysis window is
+
+    // Direction inferred from how the several transmitters changed together.
+    DirectionReport direction;
+    size_t directionTransmitters = 0;
+
+    // A comparable fingerprint of the current channel state, plus the closest
+    // previously recorded one.
+    Signature signature;
+    bool signatureValid = false;
+    Signature nearest;
+    double nearestDistance = 1.0;
+    bool nearestValid = false;
+    size_t signatureCount = 0;
 
     // Statistical analysis of the primary transmitter's envelope.
     AnomalyReport anomaly;
@@ -132,11 +152,15 @@ class Engine {
 
     void resetTracking();
 
+    // Record the current channel signature for later comparison.
+    void recordSignature();
+
   private:
     void ingest(const Observation& o);
     void selectPrimary();
     void runGeometry(double dt);
     void runVelocity();
+    void configureDerivedDetectors();
 
     mutable std::mutex cfgMtx_;
     Config cfg_;
@@ -153,8 +177,11 @@ class Engine {
     std::array<uint8_t, 6> primaryMac_{};
     bool havePrimary_ = false;
 
-    // Contact tracking and statistical anomaly analysis.
+    // Contact tracking, statistical analysis, life sign and direction.
     ContactTracker tracker_;
+    LifeSignDetector life_;
+    DirectionEstimator direction_;
+    SignatureStore signatures_;
     AnomalyDetector anomaly_;
 
     // Estimators, one set per radio family.

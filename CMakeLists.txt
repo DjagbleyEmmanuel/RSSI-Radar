@@ -21,6 +21,9 @@ add_executable(rssiradar
     src/main.cpp
     src/Dsp.cpp
     src/Tracker.cpp
+    src/LifeSign.cpp
+    src/Direction.cpp
+    src/Signature.cpp
     src/Anomaly.cpp
     src/Config.cpp
     src/Engine.cpp

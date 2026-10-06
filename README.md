@@ -219,6 +219,74 @@ unquoted profile name, and a profile named `My Home Network` silently failed
 with "unknown connection", which is indistinguishable from a card that will not
 reassociate.
 
+### Life sign, direction, and the channel signature
+
+Three further readings, on the **Signature** tab.
+
+#### Life sign: breathing
+
+A resting chest moves the order of 5 mm at roughly 0.1–0.4 Hz, and a few
+millimetres of reflector is enough to change a 5 GHz signal measurably. This is
+the basis of camera-free sleep sensing, and it is a genuinely different
+measurement from gross motion: someone can be completely still and still be
+detected.
+
+The window is long — about two minutes — and that is a hard requirement rather
+than a patience setting. The number of independent frequency bins in the search
+band is roughly `(maxHz - minHz) * T`, and a tone is only separable from the
+largest noise bin once that count is large. At 37 s there were ~20 bins, a clean
+line scored about 5x background while the largest of 20 noise bins scored about
+3x, and **pure 0.3 dB noise was reported as respiration**. At 125 s there are ~50
+bins and the two separate cleanly.
+
+Validation, on synthetic signals:
+
+| Signal | Detected | Rate found |
+|---|---|---|
+| breathing 0.25 Hz, 0.42 dB RMS | yes | 0.249 Hz |
+| breathing 0.30 Hz, 0.43 dB RMS | yes | 0.300 Hz |
+| breathing 0.22 Hz, 0.32 dB RMS | yes | 0.220 Hz |
+| white noise, 0.34 dB RMS | no | — |
+| noise 0.17 dB RMS | no | — |
+| walking at the same frequency, 2.8 dB RMS | no | — |
+| walking bursty, 2.1 dB RMS | no | — |
+| slow drift only | no | — |
+| slow access-point power drift | no | — |
+
+Two conditions must both hold: a dominant line in the band, **and** a quiet
+envelope. A sharp line in a violently varying signal is someone walking past,
+not someone asleep, and reporting that as respiration would be the worst failure
+this feature could have.
+
+**It still fires on a fan.** A periodic 0.2 Hz disturbance produces exactly the
+signature of breathing, and no statistic available here separates them. The panel
+says "periodic component consistent with respiration" and shows that caveat; it
+never claims a person.
+
+#### Direction from several access points
+
+With one receiver, bearing cannot be measured — there is no phase and no
+baseline, and no processing substitutes for either. What several access points do
+give is *which* transmitters the change is moving toward and away from, because
+each is effectively a sensor at a different location. If one rises while another
+falls, the body moved between them.
+
+This needs two or more transmitters. With one, the estimator reports unavailable
+rather than producing a number. The result is deliberately qualitative: turning
+"toward A, away from B" into a compass bearing requires those access points'
+positions surveyed and entered as anchors, and without that any heading would be
+invented.
+
+#### Signature
+
+An eight-value fingerprint of the channel state — volatility, spectral flatness,
+entropy, dominant period, kurtosis, trend, outliers, spread — recorded on every
+detection and compared against everything stored before it. It answers "does
+this resemble an earlier event", which the log cannot.
+
+It is a fingerprint of a **channel state, not of a person**. The same signature
+comes from a pet, a curtain, a fan, or an access point changing transmit power.
+
 ### Finding a transmitter by itself
 
 Monitor mode needs a frequency, not a network. Rather than making you associate

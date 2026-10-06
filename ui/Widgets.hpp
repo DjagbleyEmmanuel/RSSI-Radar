@@ -203,6 +203,22 @@ class TrackingPanelWidget : public QWidget {
     Snapshot snap_;
 };
 
+// Life sign, direction and the channel signature, shown together because they
+// are three readings of the same question asked three ways: is something here,
+// which way did it come from, and does this look like anything seen before.
+class SignaturePanelWidget : public QWidget {
+    Q_OBJECT
+  public:
+    explicit SignaturePanelWidget(QWidget* parent = nullptr);
+    void setSnapshot(const Snapshot& s);
+
+  protected:
+    void paintEvent(QPaintEvent*) override;
+
+  private:
+    Snapshot snap_;
+};
+
 // Detection timeline: a ribbon of events along a rolling time axis plus the
 // log, so a detection is visible as a mark and not only as a line of text.
 class EventTimelineWidget : public QWidget {

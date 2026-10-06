@@ -175,62 +175,194 @@ void RadarScope::paintEvent(QPaintEvent*) {
     // --- tracked contacts on the sweep.
     //
     // Drawn from the tracker's contacts rather than the raw RSSI tracks, which
-    // is what gives them a stable id, a range and -- the point of the exercise
-    // -- a disappearance timeout. A contact that stops being heard fades out
-    // over the hold window instead of vanishing between frames, so a target
-    // leaving the room reads as a deliberate event rather than a glitch.
-    for (const auto& c : snap_.contacts) {
-        const double range = c.rangeValid ? c.rangeM : rangeFromDbm(c.levelDbm);
-        // Bearing only when the fusion stage actually resolved one. Otherwise
-        // the blip is placed by a stable hash of the MAC so it does not jump
-        // around between frames, and the label says the bearing is unknown
-        // rather than implying a measured direction.
-        const double bearing = c.bearingValid ? c.bearingDeg
-                                              : static_cast<double>(macHash(c.mac) % 360);
-        const QPointF pos = toScreen(range, bearing);
-        const QColor base = theme::forMac(macHash(c.mac));
-        const int alpha = static_cast<int>(255 * std::clamp(c.presence, 0.0, 1.0));
-        const bool primary = !snap_.contacts.empty() && c.id == snap_.contacts.front().id;
+    // is what gives them a stable id, a live range and a disappearance timeout.
+    //
+    // Placement is decluttered. Without it every contact whose bearing is
+    // unknown is placed at a hash of its MAC address, so a room with a handful
+    // of transmitters puts several blips on the same spot and they become one
+    // unreadable dot. Contacts are now placed in priority order and pushed off
+    // each other, with a leader line drawn from the displaced blip back to where
+    // the contact actually is, so nothing is implied about position that the
+    // measurement does not support.
+    {
+        struct Placed {
+            QPointF truePos;
+            QPointF shownPos;
+            const Contact* c;
+            bool displaced = false;
+        };
+        std::vector<Placed> placed;
 
-        // Freshness halo: bright and tight when just heard, wide and dim as the
-        // contact ages out.
-        if (c.state == ContactState::Fading || c.state == ContactState::Lost) {
-            const double fade = std::clamp(1.0 - c.silenceSeconds / 6.0, 0.0, 1.0);
-            for (int k = 1; k <= 3; ++k) {
-                const double rr = 5.0 + k * 4.0 * (1.0 - fade) + (primary ? 3.0 : 0.0);
-                p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
-                                     static_cast<int>(46 * fade / k)),
-                              1));
-                p.setBrush(Qt::NoBrush);
-                p.drawEllipse(pos, rr, rr);
+        // Priority: the primary first, then whoever is being heard most strongly
+        // and most recently, so the blips that matter keep their true position
+        // and the marginal ones move.
+        std::vector<const Contact*> order;
+        for (const auto& c : snap_.contacts) {
+            if (c.presence <= 0.01) continue;  // fully faded out: not drawn at all
+            order.push_back(&c);
+        }
+        std::stable_sort(order.begin(), order.end(), [&](const Contact* a, const Contact* b) {
+            const bool ap = a->id == (snap_.contacts.empty() ? 0 : snap_.contacts.front().id);
+            const bool bp = b->id == (snap_.contacts.empty() ? 0 : snap_.contacts.front().id);
+            if (ap != bp) return ap;
+            if (a->levelDbm != b->levelDbm) return a->levelDbm > b->levelDbm;
+            return a->lastSeen > b->lastSeen;
+        });
+
+        const qreal minSep = 15.0;   // px between two blips
+        constexpr int kMaxShown = 14;  // beyond this the scope is unreadable anyway
+
+        int shown = 0;
+        int hidden = 0;
+        for (const Contact* c : order) {
+            if (++shown > kMaxShown) {
+                ++hidden;
+                continue;
             }
+            const double range = c->rangeValid ? c->rangeM : rangeFromDbm(c->levelDbm);
+            // Bearing only when something actually measured one. Otherwise the
+            // blip is placed by a stable hash so it does not jump frame to frame,
+            // and the label is marked so the angle is not read as a direction.
+            const double bearing =
+                c->bearingValid ? c->bearingDeg : static_cast<double>(macHash(c->mac) % 360);
+            const QPointF truePos = toScreen(range, bearing);
+
+            // Declutter: try the true position, then rotate around the ring, then
+            // step outward radially.
+            QPointF pos = truePos;
+            bool displaced = false;
+            for (int attempt = 0; attempt < 24; ++attempt) {
+                bool clash = false;
+                for (const auto& q : placed) {
+                    const qreal dx = pos.x() - q.shownPos.x();
+                    const qreal dy = pos.y() - q.shownPos.y();
+                    if (dx * dx + dy * dy < minSep * minSep) {
+                        clash = true;
+                        break;
+                    }
+                }
+                if (!clash) break;
+                displaced = true;
+                if (attempt < 12) {
+                    // Rotate 30 degrees about the centre.
+                    const double a2 = (bearing + 30.0 * (attempt + 1)) * kPi / 180.0 - kPi / 2.0;
+                    const qreal rr = std::clamp(range / rangeM_, 0.0, 1.0) * radius;
+                    pos = QPointF(centre.x() + rr * std::cos(a2), centre.y() + rr * std::sin(a2));
+                } else {
+                    // Push outward a little further each time.
+                    const qreal rr = std::clamp(range / rangeM_, 0.0, 1.0) * radius +
+                                     7.0 * (attempt - 11);
+                    pos = toScreen(rangeM_ * rr / std::max(1e-6, radius), bearing);
+                }
+            }
+
+            const QColor base = theme::forMac(macHash(c->mac));
+            const int alpha = static_cast<int>(255 * std::clamp(c->presence, 0.0, 1.0));
+            const bool primary = !snap_.contacts.empty() && c->id == snap_.contacts.front().id;
+
+            // Leader from where the contact really is to where it is being drawn.
+            if (displaced) {
+                p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
+                                     std::max(30, alpha / 4)),
+                              1, Qt::DotLine));
+                p.drawLine(truePos, pos);
+                p.setBrush(Qt::NoBrush);
+                p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
+                                     std::max(30, alpha / 3)),
+                              1));
+                p.drawEllipse(truePos, 2.5, 2.5);
+            }
+
+            // Ageing halo: bright and tight when just heard, wide and dim as the
+            // contact ages out of the hold window.
+            if (c->silenceSeconds > 0.15) {
+                const double fade = std::clamp(1.0 - c->silenceSeconds / 6.0, 0.0, 1.0);
+                for (int k = 1; k <= 3; ++k) {
+                    const double rr = 5.0 + k * 4.0 * (1.0 - fade) + (primary ? 3.0 : 0.0);
+                    p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
+                                         static_cast<int>(46 * fade / k)),
+                                  1));
+                    p.setBrush(Qt::NoBrush);
+                    p.drawEllipse(pos, rr, rr);
+                }
+            }
+
+            p.setBrush(QColor(base.red(), base.green(), base.blue(), alpha));
+            p.setPen(QPen(QColor(base.red(), base.green(), base.blue(), std::min(255, alpha)),
+                          primary ? 2 : 1));
+            const double sz = primary ? 6.5 : 4.0;
+            p.drawEllipse(pos, sz, sz);
+
+            placed.push_back({truePos, pos, c, displaced});
         }
 
-        p.setBrush(QColor(base.red(), base.green(), base.blue(), alpha));
-        p.setPen(QPen(QColor(base.red(), base.green(), base.blue(), std::min(255, alpha)),
-                      primary ? 2 : 1));
-        const double s = primary ? 6.5 : 4.0;
-        p.drawEllipse(pos, s, s);
-
-        // Leader line for the primary so its label does not sit on top of it.
-        if (primary) {
-            p.setPen(QPen(QColor(base.red(), base.green(), base.blue(), 90), 1));
-            p.drawLine(pos + QPointF(s, -s), pos + QPointF(s + 16, -s - 14));
-        }
-
-        // Label. Short by design: id, range, and the state word when fading, so
-        // the text never grows long enough to need eliding on the scope.
-        const QString tag =
-            primary ? QStringLiteral("#%1 %2m").arg(c.id).arg(range, 0, 'f', 1)
-                    : QStringLiteral("#%1").arg(c.id);
-        const QString stateTag = c.state == ContactState::Active
-                                     ? QString()
-                                     : QStringLiteral(" %1").arg(toString(c.state));
-        const QString txt = tag + stateTag + (c.bearingValid ? QString() : QStringLiteral(" ·"));
+        // Labels, stacked so they never overlap each other or a blip. Each is
+        // tied to its blip by a short leader, which is what keeps the mapping
+        // readable once several have been decluttered.
         p.setFont(QFont(font().family(), 8));
-        p.setPen(QColor(220, 240, 246, alpha));
-        p.drawText(pos + QPointF(s + 4, -s - 4), txt);
+        const QFontMetrics fm(p.font());
+        std::vector<QRectF> taken;
+        for (const auto& pl : placed) {
+            const Contact* c = pl.c;
+            const double range = c->rangeValid ? c->rangeM : rangeFromDbm(c->levelDbm);
+            const QColor base = theme::forMac(macHash(c->mac));
+            const int alpha = static_cast<int>(255 * std::clamp(c->presence, 0.0, 1.0));
+
+            QString tag = QStringLiteral("#%1").arg(c->id);
+            if (pl.displaced || rangeM_ <= range)
+                tag += QStringLiteral(" %1m").arg(range, 0, 'f', 1);
+            if (c->state != ContactState::Active) tag += QStringLiteral(" %1").arg(toString(c->state));
+            if (!c->bearingValid) tag += QStringLiteral("·");  // bearing unknown
+
+            const qreal tw = fm.horizontalAdvance(tag) + 6;
+            const qreal th = fm.height() + 2;
+            QRectF box(pl.shownPos.x() + 7, pl.shownPos.y() - th - 2, tw, th);
+
+            // Nudge down until it finds clear space, then sideways if needed.
+            for (int guard = 0; guard < 40; ++guard) {
+                bool clash = false;
+                for (const auto& r : taken)
+                    if (r.intersects(box)) {
+                        clash = true;
+                        break;
+                    }
+                if (!clash)
+                    for (const auto& q : placed) {
+                        const QRectF br(q.shownPos.x() - 8, q.shownPos.y() - 8, 16, 16);
+                        if (br.intersects(box)) {
+                            clash = true;
+                            break;
+                        }
+                    }
+                if (!clash) break;
+                box.moveTop(box.top() + th - 1);
+                if (box.bottom() > height() - 4) {
+                    box.moveTop(4);
+                    box.moveLeft(box.left() + tw + 4);
+                }
+            }
+            taken.push_back(box);
+
+            p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
+                                 std::max(40, alpha / 3)),
+                          1));
+            p.drawLine(QPointF(pl.shownPos.x() + 1, pl.shownPos.y()), box.topLeft());
+
+            p.setPen(QColor(base.red(), base.green(), base.blue(), alpha));
+            p.fillRect(box, QColor(6, 12, 16, 190));
+            p.drawRect(box);
+            p.setPen(QColor(226, 242, 248, alpha));
+            p.drawText(box, Qt::AlignCenter, tag);
+        }
         p.setFont(font());
+
+        if (hidden > 0) {
+            p.setFont(QFont(font().family(), 8));
+            p.setPen(theme::textDim());
+            p.drawText(QRect(centre.x() - 60, centre.y() - 8, 120, 16), Qt::AlignCenter,
+                       QStringLiteral("+%1 more").arg(hidden));
+            p.setFont(font());
+        }
     }
 
     // --- fused track estimate
@@ -807,6 +939,227 @@ void TrackTableWidget::paintEvent(QPaintEvent*) {
                    Qt::AlignLeft | Qt::AlignVCenter,
                    QStringLiteral("+%1 more transmitters not shown")
                        .arg(static_cast<int>(series_.size()) - lanes));
+    }
+}
+
+// ======================================================= SignaturePanelWidget
+
+SignaturePanelWidget::SignaturePanelWidget(QWidget* parent) : QWidget(parent) {
+    setMinimumHeight(190);
+}
+
+void SignaturePanelWidget::setSnapshot(const Snapshot& s) {
+    snap_ = s;
+    update();
+}
+
+void SignaturePanelWidget::paintEvent(QPaintEvent*) {
+    QPainter p(this);
+    p.setRenderHint(QPainter::Antialiasing, true);
+    p.fillRect(rect(), theme::bg());
+
+    const int W = width();
+    const int left = 12;
+    // Three side by side when there is room, otherwise stacked. An earlier
+    // version simply stopped after the first column when narrow, which meant the
+    // Direction and Signature readings were never shown at all -- and the tab is
+    // narrow in the default layout, so that was the normal case rather than an
+    // edge case.
+    const bool wide = W > 760;
+    const int colW = wide ? (W - 2 * left) / 3 : W - 2 * left;
+    // When stacked, every section spans the full width from the same left margin.
+    // Offsetting them horizontally as well pushed the second and third off the
+    // right edge, which is how this first went in.
+    const int x1 = left;
+    const int x2 = wide ? left + colW : left;
+    const int x3 = wide ? left + 2 * colW : left;
+    // When stacked, each section gets a third of the height and its own band.
+    const int bandH = wide ? height() : std::max(120, height() / 3);
+    const int y2off = wide ? 0 : bandH;
+    const int y3off = wide ? 0 : 2 * bandH;
+
+    p.setFont(QFont(font().family(), 8, QFont::Bold));
+    p.setPen(theme::violet());
+
+    // ---------------- column 1: life sign
+    p.drawText(QPoint(x1, 14), QStringLiteral("LIFE SIGN"));
+    p.setFont(font());
+    {
+        const auto& ls = snap_.lifeSign;
+        int y = 32;
+
+        // Progress toward a usable window. Reporting nothing at all until the
+        // window is full is deliberate, so this bar is the honest explanation for
+        // an otherwise blank panel.
+        const QRectF bar(x1, y - 9, colW - 16, 6);
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(22, 36, 43));
+        p.drawRoundedRect(bar, 3, 3);
+        p.setBrush(theme::violet());
+        p.drawRoundedRect(
+            QRectF(bar.left(), bar.top(), bar.width() * std::clamp(snap_.lifeSignProgress, 0.0, 1.0),
+                   bar.height()),
+            3, 3);
+        p.setBrush(Qt::NoBrush);
+
+        if (ls.samples == 0) {
+            p.setPen(theme::textDim());
+            p.drawText(QRect(x1, y + 4, colW - 12, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("NO DATA"));
+        } else if (ls.reason == std::string("collecting")) {
+            p.setPen(theme::textDim());
+            p.drawText(QRect(x1, y + 4, colW - 12, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("collecting %1%").arg(snap_.lifeSignProgress * 100.0, 0, 'f', 0));
+            p.drawText(QRect(x1, y + 22, colW - 12, 32), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                       QStringLiteral("needs a long window — respiration is 0.1–0.5 Hz, so "
+                                      "several minutes of history"));
+        } else {
+            const QColor c = ls.detected ? theme::green() : theme::textDim();
+            p.setPen(c);
+            p.setFont(QFont(font().family(), 15));
+            p.drawText(QRect(x1, y + 2, colW - 12, 22),
+                       Qt::AlignLeft | Qt::AlignVCenter,
+                       ls.detected ? QStringLiteral("PRESENT")
+                                   : QStringLiteral("no clear cycle"));
+            p.setFont(font());
+            y += 28;
+            p.setPen(QColor(180, 206, 216));
+            p.drawText(QRect(x1, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("rate %1 Hz · strength %2")
+                           .arg(ls.rateHz, 0, 'f', 3)
+                           .arg(ls.strength * 100.0, 0, 'f', 0)
+                           + QStringLiteral("%"));
+            y += 15;
+            p.setPen(QColor(150, 180, 192));
+            p.drawText(QRect(x1, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("envelope %1 dB RMS · %2 s window")
+                           .arg(ls.rmsDb, 0, 'f', 2)
+                           .arg(ls.windowSeconds, 0, 'f', 0));
+            y += 15;
+            p.setPen(QColor(120, 150, 164));
+            p.setFont(QFont(font().family(), 8));
+            QFontMetrics fm(p.font());
+            p.drawText(QRect(x1, y, colW - 12, 30), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                       fm.elidedText(QString::fromStdString(ls.reason), Qt::ElideRight,
+                                     colW - 12) +
+                           QStringLiteral("  (not proof of a person — a fan or a "
+                                          "curtain looks identical)"));
+            p.setFont(font());
+        }
+    }
+
+    if (!wide) {
+        p.setPen(QPen(QColor(28, 48, 58), 1));
+        p.drawLine(left, bandH - 6, W - left, bandH - 6);
+        p.drawLine(left, 2 * bandH - 6, W - left, 2 * bandH - 6);
+    }
+
+    // ---------------- column 2: direction
+    p.setFont(QFont(font().family(), 8, QFont::Bold));
+    p.setPen(theme::amber());
+    p.drawText(QPoint(x2, 14 + y2off), QStringLiteral("DIRECTION"));
+    p.setFont(font());
+    {
+        const auto& d = snap_.direction;
+        int y = 32 + y2off;
+        p.setPen(theme::textDim());
+        p.drawText(QRect(x2, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                   QStringLiteral("%1 transmitters tracked")
+                       .arg(snap_.directionTransmitters));
+
+        y += 18;
+        if (!d.available) {
+            p.setPen(QColor(150, 180, 192));
+            QFontMetrics fm(font());
+            p.drawText(QRect(x2, y, colW - 12, 34), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                       fm.elidedText(QString::fromStdString(d.reason), Qt::ElideRight,
+                                     colW - 12));
+        } else {
+            p.setFont(QFont(font().family(), 10));
+            p.setPen(theme::amber());
+            p.drawText(QRect(x2, y, colW - 12, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("→ %1").arg(QString::fromStdString(d.risenLabel)));
+            y += 18;
+            p.setPen(theme::cyan());
+            p.drawText(QRect(x2, y, colW - 12, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("← %1").arg(QString::fromStdString(d.fallenLabel)));
+            y += 20;
+            p.setFont(font());
+            p.setPen(QColor(180, 206, 216));
+            p.drawText(QRect(x2, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("%1 / %2 dB · spread %3 dB")
+                           .arg(d.risenDb, 0, 'f', 1)
+                           .arg(d.fallenDb, 0, 'f', 1)
+                           .arg(d.spreadDb, 0, 'f', 1));
+            y += 15;
+            p.setPen(QColor(150, 180, 192));
+            p.drawText(QRect(x2, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("quality %1% · %2 changed")
+                           .arg(d.quality * 100.0, 0, 'f', 0)
+                           .arg(d.contributors));
+        }
+        p.setFont(QFont(font().family(), 8));
+        p.setPen(QColor(120, 150, 164));
+        QFontMetrics fm(p.font());
+        p.drawText(QRect(x2, (wide ? height() - 34 : y2off + bandH - 30), colW - 12, 28),
+                   Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                   fm.elidedText(QString::fromStdString(d.caveat), Qt::ElideRight, colW - 12));
+        p.setFont(font());
+    }
+
+    // ---------------- column 3: signature
+    p.setFont(QFont(font().family(), 8, QFont::Bold));
+    p.setPen(theme::green());
+    p.drawText(QPoint(x3, 14 + y3off), QStringLiteral("SIGNATURE"));
+    p.setFont(font());
+    {
+        int y = 32 + y3off;
+        if (!snap_.signatureValid) {
+            p.setPen(theme::textDim());
+            p.drawText(QRect(x3, y, colW - 12, 18), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("recorded on each detection"));
+        } else {
+            const Signature& g = snap_.signature;
+            const double bounds[8][2] = {{0.2, 4.0}, {0.0, 1.0}, {0.3, 1.0}, {0.0, 6.0},
+                                         {2.5, 12.0}, {-3.0, 3.0}, {0.0, 12.0}, {0.2, 6.0}};
+            p.setFont(QFont(font().family(), 8));
+            for (int i = 0; i < 8; ++i) {
+                const QRectF bar(x3 + 76, y - 8, colW - 150, 5);
+                p.setPen(Qt::NoPen);
+                p.setBrush(QColor(22, 36, 43));
+                p.drawRoundedRect(bar, 2, 2);
+                const double f = std::clamp((g.v[i] - bounds[i][0]) /
+                                                (bounds[i][1] - bounds[i][0]),
+                                            0.0, 1.0);
+                p.setBrush(theme::green());
+                p.drawRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * f, bar.height()),
+                                  2, 2);
+                p.setBrush(Qt::NoBrush);
+                p.setPen(QColor(150, 180, 192));
+                p.drawText(QRect(x3, y - 11, 74, 12), Qt::AlignLeft | Qt::AlignVCenter,
+                           QString::fromLatin1(signatureFeatureName(static_cast<size_t>(i))));
+                y += 13;
+            }
+            p.setFont(font());
+            y += 6;
+            p.setPen(QColor(180, 206, 216));
+            p.drawText(QRect(x3, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                       QStringLiteral("%1 stored").arg(snap_.signatureCount));
+            y += 16;
+            if (snap_.nearestValid) {
+                const bool close = snap_.nearestDistance < 0.18;
+                p.setPen(close ? theme::green() : theme::textDim());
+                p.drawText(QRect(x3, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                           QStringLiteral("closest match %1")
+                               .arg(snap_.nearestDistance, 0, 'f', 3));
+                y += 14;
+                p.setPen(QColor(150, 180, 192));
+                p.drawText(QRect(x3, y, colW - 12, 15), Qt::AlignLeft | Qt::AlignVCenter,
+                           QStringLiteral("%1")
+                               .arg(close ? QStringLiteral("resembles a previous event")
+                                          : QStringLiteral("unlike anything recorded")));
+            }
+        }
     }
 }
 

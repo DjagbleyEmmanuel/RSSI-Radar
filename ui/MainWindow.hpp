@@ -27,6 +27,7 @@ class WaterfallWidget;
 class VelocitySpectrumWidget;
 class TrackTableWidget;
 class TrackingPanelWidget;
+class SignaturePanelWidget;
 class EventTimelineWidget;
 
 class MainWindow : public QMainWindow {
@@ -76,6 +77,7 @@ class MainWindow : public QMainWindow {
     TrackTableWidget* tracks_ = nullptr;
     EventTimelineWidget* timeline_ = nullptr;
     TrackingPanelWidget* tracking_ = nullptr;
+    SignaturePanelWidget* signature_ = nullptr;
 
     QLabel* statusDot_ = nullptr;
     QLabel* statusText_ = nullptr;
