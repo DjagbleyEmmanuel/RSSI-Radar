@@ -71,6 +71,12 @@ struct Snapshot {
 
     // Tracked contacts with stable ids, ranges and disappearance timeouts.
     std::vector<Contact> contacts;
+
+    // Transient motion marks: where the detector has recently tripped.
+    std::vector<MotionMark> motionMarks;
+    // Longest range currently on the scope, used to fit the range rings so marks
+    // are not all crushed against the centre.
+    double motionRangeExtentM = 0.0;
     uint64_t contactsCreated = 0;
 
     // Life-sign: a long-window look for respiration in the envelope.
@@ -171,6 +177,7 @@ class Engine {
     mutable std::mutex snapMtx_;
     Snapshot snap_;
     std::vector<RadarEvent> events_;
+    std::vector<MotionMark> marks_;
 
     mutable std::mutex trackMtx_;
     std::map<uint64_t, RssiTrack> tracks_;  // keyed by macHash

@@ -223,6 +223,31 @@ reassociate.
 
 Three further readings, on the **Signature** tab.
 
+#### What the scope shows, and what it cannot
+
+The scope draws two different things, and conflating them is why it used to look
+broken:
+
+* **Contacts** (solid circles) are **transmitters**. One exists per access point
+  in range and it does not move. With a single access point that is a single
+  stationary dot, always.
+* **Motion marks** (hollow dotted diamonds) are **events**. One is dropped each
+  time the detector trips, labelled with its range and age, and fades over its
+  lifetime. A sequence of trips leaves a trail showing where activity has been.
+
+RSSI gives one number per transmitter per moment. From one receiver and one
+access point there is no way to locate a *person*: there is nothing to triangulate
+and no phase to work with. What can be shown honestly is where the energy is
+coming from and where changes are being seen.
+
+With fewer than two access points there is no bearing, so the marks are laid out
+along a range axis at a documented placeholder angle and the scope says so
+rather than drawing a confident arrow in an arbitrary direction.
+
+Range rings fit the data in both directions, with the slider acting as the maximum
+range shown. They previously only ever expanded, which left a 0.3 m contact as a
+dot on the centre of a 12 m scope.
+
 #### Life sign: breathing
 
 A resting chest moves the order of 5 mm at roughly 0.1–0.4 Hz, and a few

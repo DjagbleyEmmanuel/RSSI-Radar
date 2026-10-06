@@ -119,6 +119,30 @@ struct SensorStatus {
     std::vector<std::string> capabilities;
 };
 
+// A transient mark dropped where motion was detected.
+//
+// This is a different thing from a contact, and conflating them is why the scope
+// used to look broken. A contact is a *transmitter*: one exists per access point
+// in range, and a room with one access point has exactly one, always. A mark is
+// an *event*: the detector tripped, and this records what the estimate was at that
+// moment. Marks appear, age and fade, so a sequence of trips leaves a trail
+// showing where activity has been rather than one static dot.
+//
+// Range is measured. Bearing is not, unless anchors have been surveyed -- so
+// bearingValid is false in almost every real case and the UI must say so rather
+// than drawing a confident-looking direction that was never determined.
+struct MotionMark {
+    double wallTime = 0.0;
+    double rangeM = 0.0;
+    double bearingDeg = 0.0;
+    bool bearingValid = false;
+    double confidence = 0.0;
+    double rssiDbm = 0.0;
+    double velocityMps = 0.0;
+    bool velocityValid = false;
+    std::string label;
+};
+
 // A live per-transmitter RSSI history, the core signal the DSP works on.
 struct RssiTrack {
     std::array<uint8_t, 6> mac{};

@@ -448,9 +448,9 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     // traffic rather than demanding that a network be joined. A monitor-mode
     // interface hears beaconing access points it has never joined, so this is
     // what makes the radio usable with nothing but its own antenna.
+    std::string sweepSummary;
     if (needSweep) {
-        std::string sweepDetail;
-        const int found = sweepBand(260, &sweepDetail);
+        const int found = sweepBand(260, &sweepSummary);
         if (found > 0) autoChannel_ = found;
     }
 
@@ -472,7 +472,8 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
             else
                 *err = "could not determine a WiFi channel to listen on; " + iface_ +
                        " is not associated with any network. Connect to a network "
-                       "and start again.";
+                       "and start again." +
+                       (sweepSummary.empty() ? "" : "\n" + sweepSummary);
         }
         reason_ = UnavailableReason::NotPresent;
         restoreNetworkManager();   // never leave the device released on failure

@@ -640,6 +640,41 @@ void Engine::tick() {
     // A signature is recorded on every trip, so it can be compared later.
     if (det.state == DetectionState::Present && velocityPeakLatched_) recordSignature();
 
+    // A motion mark on every rising edge of the detector. These are the marks the
+    // scope draws as fading hollow circles, and they are deliberately separate
+    // from the contact blips: a contact is a transmitter and does not move, while
+    // a mark is an event and does.
+    if (det.state == DetectionState::Present && !velocityPeakLatched_) {
+        MotionMark m;
+        m.wallTime = std::chrono::duration<double>(t0.time_since_epoch()).count();
+        m.rangeM = snap_.contacts.empty() ? 0.0
+                                          : (snap_.contacts.front().rangeValid
+                                                 ? snap_.contacts.front().rangeM
+                                                 : pathLoss_.rangeFromRssi(meanDbm));
+        m.confidence = det.confidence;
+        m.rssiDbm = meanDbm;
+        m.velocityMps = snap_.radialVelocityMps;
+        m.velocityValid = snap_.velocityValid;
+        m.label = primaryLabel;
+        if (snap_.fusion.ok) {
+            m.bearingDeg = snap_.fusion.bearingDeg;
+            m.bearingValid = true;
+        }
+        marks_.push_back(m);
+    }
+
+    // Age out marks once they are older than their lifetime.
+    {
+        const double nowWall = std::chrono::duration<double>(t0.time_since_epoch()).count();
+        const double life = cfg_.motionMarkSeconds > 0.5 ? cfg_.motionMarkSeconds : 12.0;
+        while (!marks_.empty() && nowWall - marks_.front().wallTime > life) marks_.erase(marks_.begin());
+        if (marks_.size() > 400) marks_.erase(marks_.begin(), marks_.end() - 400);
+    }
+    snap_.motionMarks = marks_;
+    snap_.motionRangeExtentM = 0.0;
+    for (const auto& m : marks_)
+        if (m.rangeM > snap_.motionRangeExtentM) snap_.motionRangeExtentM = m.rangeM;
+
     // Event log, carrying the range interval so a log line stands on its own.
     if (det.state == DetectionState::Present && !velocityPeakLatched_) {
         velocityPeakLatched_ = true;

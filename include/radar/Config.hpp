@@ -152,17 +152,21 @@ struct Config {
 
     // Life-sign detection. The window is derived from minCycles and minHz, so a
     // slower rate needs proportionally more history before anything is reported.
-        bool lifeSignEnabled = true;
+    bool lifeSignEnabled = true;
         double lifeSignMinHz = 0.08;
         double lifeSignMaxHz = 0.5;
         double lifeSignMinCycles = 3.0;
         double lifeSignMinStrength = 0.42;
-        // Envelope RMS ceiling, in dB. Above this the periodicity is motion.
+    // Envelope RMS ceiling, in dB. Above this the periodicity is motion.
         double lifeSignMaxRmsDb = 1.6;
-        // Minimum change, in dB, before a transmitter contributes to a direction.
+    // Minimum change, in dB, before a transmitter contributes to a direction.
         double directionMinChangeDb = 1.2;
-        // How many signatures to keep for comparison.
+    // How many signatures to keep for comparison.
         size_t signatureCapacity = 32;
+    // How long a motion mark survives on the scope before it fades away.
+    // Marks are events, not transmitters: they appear when the detector trips
+    // and age out, so a sequence of trips leaves a trail.
+        double motionMarkSeconds = 14.0;
     PathLossConfig pathLoss;
     WindowConfig window;
     EstimatorConfig estimator;

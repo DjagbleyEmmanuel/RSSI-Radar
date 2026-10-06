@@ -94,6 +94,31 @@ void RadarScope::paintEvent(QPaintEvent*) {
     };
 
     // --- range rings
+    //
+    // The ring scale follows the data when there is data. A fixed 12 m range was
+    // the other reason the scope looked broken: an access point at -31 dBm
+    // inverts to about 2 m, so its blip sat almost exactly on the centre and the
+    // outer rings were wasted on empty space. Rings are only stretched to fit
+    // once something is actually out there, and never shrunk below the operator's
+    // setting.
+    double displayRange = rangeM_;
+    {
+        double extent = snap_.motionRangeExtentM;
+        for (const auto& c : snap_.contacts) {
+            const double r = c.rangeValid ? c.rangeM : rangeFromDbm(c.levelDbm);
+            if (r > extent) extent = r;
+        }
+        if (extent > 0.05) {
+            // Fit the rings to the data in *both* directions. They previously only
+            // ever expanded, which left a 0.3 m contact as a dot on the centre of a
+            // 12 m scope -- the other half of why the scope looked dead. The slider
+            // becomes the maximum range shown rather than a fixed scale, with a
+            // floor so a near-field contact cannot blow the rings up to nothing.
+            const double fitted = std::max(1.0, std::ceil(extent * 1.8));
+            displayRange = std::clamp(fitted, 1.0, std::max(1.0, rangeM_));
+        }
+    }
+    const double ringRange = displayRange;
     const int rings = 4;
     for (int i = 1; i <= rings; ++i) {
         const double f = i / static_cast<double>(rings);
@@ -101,11 +126,19 @@ void RadarScope::paintEvent(QPaintEvent*) {
         p.drawEllipse(centre, radius * f, radius * f);
         if (showGrid_) {
             p.setPen(theme::grid());
-            const double label = rangeM_ * f;
+            const double label = ringRange * f;
             p.drawText(QPointF(centre.x() + 3, centre.y() - radius * f - 2),
                        QString::number(label, 'g', 3) + " m");
         }
     }
+    // Whether anything is sitting on or beyond the outer ring, so a near-field
+    // contact is visibly clamped rather than silently off-scale.
+    double widest = snap_.motionRangeExtentM;
+    for (const auto& c : snap_.contacts) {
+        const double r = c.rangeValid ? c.rangeM : rangeFromDbm(c.levelDbm);
+        if (r > widest) widest = r;
+    }
+    const bool clamped = widest > ringRange * 0.99;
 
     // --- bearing spokes
     if (showGrid_) {
@@ -169,6 +202,87 @@ void RadarScope::paintEvent(QPaintEvent*) {
             p.drawArc(QRectF(centre.x() - radius - 7, centre.y() - radius - 7,
                               (radius + 7) * 2, (radius + 7) * 2),
                       static_cast<int>(frac * -90 * 16), static_cast<int>(0.06 * -90 * 16));
+        }
+    }
+
+    // --- motion marks.
+    //
+    // A contact is a transmitter: one exists per access point in range and it
+    // does not move. With a single access point that is a single stationary dot,
+    // which is exactly what the scope used to show and read as broken. A mark is
+    // an *event* -- the detector tripped -- and these are the transient, fading
+    // indicators of where activity has been detected.
+    //
+    // Bearing is only drawn when anchors resolved one. With a single access point
+    // there is no direction to measure, so the marks are laid out along a range
+    // axis at a clearly-marked placeholder bearing and the caption says so. A
+    // confident-looking arrow in an arbitrary direction would be a fabrication.
+    {
+        const double nowWall =
+            std::chrono::duration<double>(snap_.stamp.time_since_epoch()).count();
+        const double life = 14.0;
+        const bool anyBearing = snap_.fusion.ok;
+
+        for (const auto& m : snap_.motionMarks) {
+            const double age = nowWall - m.wallTime;
+            if (age < 0.0 || age > life) continue;
+            const double fade = 1.0 - age / life;
+            const double conf = std::clamp(m.confidence, 0.0, 1.0);
+
+            // Without a measured bearing, spread along a horizontal range axis at
+            // a documented placeholder rather than inventing a direction.
+            const double bearing = m.bearingValid ? m.bearingDeg : 0.0;
+            QPointF pos;
+            if (m.bearingValid) {
+                pos = toScreen(m.rangeM, bearing);
+            } else {
+                const double f = std::clamp(m.rangeM / ringRange, 0.0, 1.0);
+                pos = QPointF(centre.x() + f * radius, centre.y());
+            }
+
+            // Fading halo, growing and dimming as the mark ages: a recent
+            // detection is tight and bright, an old one is wide and faint.
+            const int alpha = static_cast<int>(200 * fade * (0.35 + 0.65 * conf));
+            if (alpha <= 3) continue;
+            for (int k = 1; k <= 3; ++k) {
+                const double rr = 4.0 + k * (3.5 + 9.0 * (1.0 - fade));
+                p.setPen(QPen(QColor(255, 150, 90, std::max(6, alpha / (5 * k))), 1,
+                              Qt::DotLine));
+                p.setBrush(Qt::NoBrush);
+                p.drawEllipse(pos, rr, rr);
+            }
+
+            // The mark itself: a hollow dotted diamond, deliberately unlike the
+            // solid contact blip so the two are never confused.
+            const double sz = 6.0;
+            p.setPen(QPen(QColor(255, 140, 80, alpha), 1.6));
+            p.setBrush(QColor(20, 10, 6, std::min(160, alpha)));
+            QPolygonF diamond;
+            diamond << QPointF(pos.x(), pos.y() - sz) << QPointF(pos.x() + sz, pos.y())
+                    << QPointF(pos.x(), pos.y() + sz) << QPointF(pos.x() - sz, pos.y());
+            p.drawPolygon(diamond);
+
+            // Age and range on a leader, shown only while it still means
+            // something: a screen full of numbers ages out of usefulness fast.
+            if (fade > 0.25) {
+                p.setFont(QFont(font().family(), 8));
+                p.setPen(QColor(255, 190, 150, static_cast<int>(220 * fade)));
+                p.drawText(pos + QPointF(sz + 4, -sz),
+                           QStringLiteral("%1m  %2s ago")
+                               .arg(m.rangeM, 0, 'f', 1)
+                               .arg(age, 0, 'f', 0));
+                p.setFont(font());
+            }
+        }
+
+        // One caption, rather than a per-mark caveat repeated a dozen times.
+        if (!snap_.motionMarks.empty() && !anyBearing) {
+            p.setFont(QFont(font().family(), 8));
+            p.setPen(QColor(255, 190, 150, 170));
+            p.drawText(QRectF(centre.x() - radius, centre.y() + radius * 0.72, radius * 2, 16),
+                       Qt::AlignCenter,
+                       QStringLiteral("marks on a range axis — bearing unknown (1 access point)"));
+            p.setFont(font());
         }
     }
 
