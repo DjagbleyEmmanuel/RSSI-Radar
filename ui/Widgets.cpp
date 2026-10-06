@@ -275,13 +275,37 @@ void RadarScope::paintEvent(QPaintEvent*) {
             }
         }
 
-        // One caption, rather than a per-mark caveat repeated a dozen times.
+        // A compact badge at the left edge rather than a sentence across the
+        // middle of the scope. The earlier caption spanned the full width of the
+        // sweep and sat right where the marks are, which is the worst possible
+        // place for a piece of text that exists to explain them.
         if (!snap_.motionMarks.empty() && !anyBearing) {
-            p.setFont(QFont(font().family(), 8));
-            p.setPen(QColor(255, 190, 150, 170));
-            p.drawText(QRectF(centre.x() - radius, centre.y() + radius * 0.72, radius * 2, 16),
-                       Qt::AlignCenter,
-                       QStringLiteral("marks on a range axis — bearing unknown (1 access point)"));
+            const int apCount = std::max(1, static_cast<int>(snap_.directionTransmitters));
+            const QString badge = apCount > 1 ? QStringLiteral("BEARING N/A")
+                                             : QStringLiteral("1 AP · BEARING N/A");
+
+            p.setFont(QFont(font().family(), 8, QFont::Bold));
+            const QFontMetrics fm(p.font());
+            const int tw = fm.horizontalAdvance(badge) + 30;
+            const int th = 18;
+            const QRect box(10, 10, tw, th);
+
+            p.setPen(QPen(QColor(255, 186, 66, 120), 1));
+            p.setBrush(QColor(14, 11, 6, 215));
+            p.drawRoundedRect(box, 9, 9);
+
+            // Miniature compass with no needle: reads as "no direction" at a
+            // glance without needing to be read at all.
+            const QPoint cc(box.left() + 13, box.center().y());
+            p.setPen(QPen(QColor(255, 186, 66, 150), 1, Qt::DotLine));
+            p.setBrush(Qt::NoBrush);
+            p.drawEllipse(cc, 5, 5);
+            p.setPen(QPen(QColor(255, 186, 66, 190), 1.2));
+            p.drawLine(cc + QPoint(-3, 3), cc + QPoint(3, -3));
+
+            p.setPen(QColor(255, 206, 140, 225));
+            p.drawText(QRect(box.left() + 23, box.top(), tw - 26, th),
+                       Qt::AlignLeft | Qt::AlignVCenter, badge);
             p.setFont(font());
         }
     }
