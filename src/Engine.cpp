@@ -728,6 +728,16 @@ void Engine::tick() {
         velocityPeakLatched_ = false;
     }
     snap_.events = events_;
+
+    // Publish once, at the end of the tick, rather than leaving every consumer to
+    // deep-copy the Snapshot itself. One copy per tick however many widgets are
+    // listening, and consumers get an immutable handle that stays valid while the
+    // engine writes its next one.
+    //
+    // No lock here: snapMtx_ was taken above, at the top of the snapshot assembly,
+    // and is still held. snapMtx_ is a plain std::mutex, not a recursive one, so
+    // locking it a second time on this thread deadlocks the pipeline outright.
+    snapShared_ = std::make_shared<const Snapshot>(snap_);
 }
 
 void Engine::configureDerivedDetectors() {
@@ -773,9 +783,9 @@ void Engine::recordSignature() {
     }
 }
 
-Snapshot Engine::snapshot() const {
+std::shared_ptr<const Snapshot> Engine::snapshot() const {
     std::lock_guard<std::mutex> lk(snapMtx_);
-    return snap_;
+    return snapShared_;
 }
 
 HardwareSurvey Engine::hardware() const { return surveyHardware(); }

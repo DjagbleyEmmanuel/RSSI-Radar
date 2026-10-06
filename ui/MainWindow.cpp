@@ -265,21 +265,35 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent) {
     for (const auto& n : survey.notes) notes << QString("\u2022 ") + qs(n);
     notes_->setPlainText(notes.join("\n"));
 
-    // The animation clock never stops: without it a QWidget only repaints when
-    // something dirties it, so the radar scope sits frozen until the window is
-    // moved. 30 fps is plenty for a 72 deg/s sweep and costs almost nothing.
-    connect(&animTimer_, &QTimer::timeout, this, [this] {
-        scope_->update();
-        if (engine_.running()) onTick();
-    });
+    // Two independent clocks, deliberately kept separate.
+    //
+    // animTimer_ drives the sweep animation only. The scope is repainted from it
+    // whether or not the engine is running, because without a clock a QWidget
+    // only repaints when something dirties it and the radar would sit frozen
+    // until the window was moved. 30 fps is plenty for a 72 deg/s sweep and
+    // costs almost nothing.
+    //
+    // It used to call onTick() as well, while pipelineTimer_ also called it. So
+    // the whole pipeline ran at 30 Hz plus refreshHz -- about 50 Hz instead of
+    // the configured 20 -- which meant the engine tick, a full Snapshot copy,
+    // every plot's setSnapshot() and the telemetry repaint all ran two and a
+    // half times as often as asked for. Data cadence and animation cadence are
+    // different things and now only pipelineTimer_ advances the data.
+    connect(&animTimer_, &QTimer::timeout, this, [this] { scope_->update(); });
     animTimer_.start(33);
 
+    // Collects the outcome of a sensor start that is running on a worker.
+    connect(&startPoll_, &QTimer::timeout, this, &MainWindow::pollStartFinished);
     connect(&pipelineTimer_, &QTimer::timeout, this, &MainWindow::onTick);
     connect(startBtn_, &NeonButton::clicked, this, &MainWindow::onStart);
     connect(stopBtn_, &NeonButton::clicked, this, &MainWindow::onStop);
 }
 
 MainWindow::~MainWindow() {
+    // A worker still inside engine_.start() holds the engine, so it has to be
+    // joined before anything else is destroyed.
+    startCancel_ = true;
+    joinStartWorker();
     animTimer_.stop();
     pipelineTimer_.stop();
     engine_.stop();
@@ -502,26 +516,56 @@ QWidget* MainWindow::buildAnchorPanel() {
     return box;
 }
 
-void MainWindow::refreshSensorPanel() {
-    const Snapshot s = engine_.snapshot();
-    sensorTable_->setRowCount(static_cast<int>(s.sensors.size()));
-    for (int i = 0; i < static_cast<int>(s.sensors.size()); ++i) {
+void MainWindow::refreshSensorPanel(const Snapshot& s) {
+    // Cheap signature of everything this panel displays. If nothing has changed,
+    // do nothing at all.
+    //
+    // This used to run on every pipeline tick and, each time, take a *second* full
+    // copy of the Snapshot via engine_.snapshot(), then allocate a fresh
+    // QTableWidgetItem for every cell and hand it to setItem(). setItem() deletes
+    // the previous item and resets the row, so that was twelve heap allocations,
+    // twelve deletions and a dozen table resets several times a second, to redraw
+    // a panel whose text usually had not moved.
+    QString sig;
+    sig.reserve(256);
+    for (const auto& st : s.sensors) {
+        sig += QString::number(static_cast<int>(st.active));
+        sig += static_cast<char>(st.available ? '1' : '0');
+        sig += QString::number(static_cast<int>(st.rateHz));
+        sig += QLatin1Char('|');
+        sig += QString::fromStdString(st.name);
+        sig += QLatin1Char('|');
+        sig += QString::fromStdString(st.detail);
+        sig += QLatin1Char('\n');
+    }
+    if (sig == sensorPanelSig_) return;
+    sensorPanelSig_ = sig;
+
+    const int rows = static_cast<int>(s.sensors.size());
+    if (sensorTable_->rowCount() != rows) sensorTable_->setRowCount(rows);
+
+    // Update in place where possible, so a changed panel does not churn the heap
+    // either.
+    const auto put = [&](int row, int col, const QString& text, const QString& colour) {
+        QTableWidgetItem* item = sensorTable_->item(row, col);
+        if (!item) {
+            item = new QTableWidgetItem;
+            sensorTable_->setItem(row, col, item);
+        }
+        if (item->text() != text) item->setText(text);
+        item->setForeground(QColor(colour));
+    };
+
+    for (int i = 0; i < rows; ++i) {
         const auto& st = s.sensors[static_cast<size_t>(i)];
-        auto set = [&](int col, const QString& text, const QString& colour = QString()) {
-            auto* item = new QTableWidgetItem(text);
-            if (!colour.isEmpty()) {
-                item->setForeground(QColor(colour));
-            }
-            sensorTable_->setItem(i, col, item);
-        };
-        set(0, QString::fromStdString(st.name), "#C4E0E8");
-        if (st.active) set(1, "ACTIVE", "#60FFA8");
-        else if (st.available) set(1, "IDLE", "#FFBA42");
-        else set(1, "OFF", "#FF5656");
-        set(2, st.rateHz > 0 ? QString::number(st.rateHz, 'f', 0) + " Hz" : "—");
+        put(i, 0, QString::fromStdString(st.name), "#C4E0E8");
+        if (st.active) put(i, 1, "ACTIVE", "#60FFA8");
+        else if (st.available) put(i, 1, "IDLE", "#FFBA42");
+        else put(i, 1, "OFF", "#FF5656");
+        put(i, 2, st.rateHz > 0 ? QString::number(st.rateHz, 'f', 0) + " Hz" : QStringLiteral("\u2014"), "#9FC4D2");
         // Wrap rather than truncate: the detail string is where the honest
         // failure reasons live, so cutting it off hides the diagnosis.
-        set(3, QString::fromStdString(st.detail));
+        put(i, 3, QString::fromStdString(st.detail), "#9FC4D2");
     }
 }
 
@@ -561,7 +605,11 @@ void MainWindow::refreshTelemetry(const Snapshot& s) {
 
 void MainWindow::onTick() {
     engine_.tick();
-    const Snapshot s = engine_.snapshot();
+    // Shared handle, not a copy: the widgets below keep it for the duration of
+    // this repaint and the engine keeps writing its own working copy meanwhile.
+    const std::shared_ptr<const Snapshot> sp = engine_.snapshot();
+    if (!sp) return;
+    const Snapshot& s = *sp;
 
     scope_->setSnapshot(s);
     timeseries_->setSnapshot(s);
@@ -576,14 +624,28 @@ void MainWindow::onTick() {
     scope_->setShowTrails(trailsChk_->isChecked());
 
     refreshTelemetry(s);
-    refreshSensorPanel();
+    refreshSensorPanel(s);
 
+    // Only touch Qt when the value has actually changed.
+    //
+    // setStyleSheet() is not a cheap setter: Qt re-parses the stylesheet and
+    // re-polishes the widget and its children every time it is called, even when
+    // the string is identical to what is already set. Doing that to two labels on
+    // every pipeline tick meant a full style recomputation several times a
+    // second for text that almost never changed.
     const bool present = s.detection.state == DetectionState::Present;
-    statusDot_->setStyleSheet(present ? "color:#FF5656; font-size:17px;"
-                                      : "color:#60FFA8; font-size:17px;");
-    statusText_->setText(present ? "MOTION DETECTED"
-                                 : (engine_.running() ? "MONITORING" : "STOPPED"));
-    statusText_->setStyleSheet(present ? "color:#FF5656;" : "color:#60FFA8;");
+    static bool lastPresent = false;
+    static bool lastRunning = true;
+    const bool running = engine_.running();
+    if (present != lastPresent || running != lastRunning) {
+        lastPresent = present;
+        lastRunning = running;
+        statusDot_->setStyleSheet(present ? "color:#FF5656; font-size:17px;"
+                                          : "color:#60FFA8; font-size:17px;");
+        statusText_->setStyleSheet(present ? "color:#FF5656;" : "color:#60FFA8;");
+        statusText_->setText(present ? "MOTION DETECTED"
+                                     : (running ? "MONITORING" : "STOPPED"));
+    }
 
     // Push new events into the log.
     //
@@ -627,7 +689,10 @@ void MainWindow::onClearEvents() {
     // is appended rather than the whole ring being replayed.
     if (eventLog_) eventLog_->clear();
     if (eventCount_) eventCount_->setText(QStringLiteral("0"));
-    eventsShown_ = engine_.snapshot().events.size();
+    // This used to deep-copy the entire Snapshot, sample history and all, purely
+    // to read one size. The engine does not clear its own ring, so the visible
+    // index is re-synchronised to where it already is.
+    if (const auto sp = engine_.snapshot()) eventsShown_ = sp->events.size();
     if (timeline_) timeline_->clearMarks();
     if (notes_) notes_->appendPlainText(
         QStringLiteral("[%1]  history cleared by operator")
@@ -635,29 +700,108 @@ void MainWindow::onClearEvents() {
 }
 
 void MainWindow::onStart() {
-    if (engine_.running()) return;
+    if (engine_.running() || startBusy_) return;
 
-    // Raw capture needs CAP_NET_RAW. Try, and say precisely why if it fails.
-    std::string err;
-    if (!engine_.start(&err)) {
+    // Sensor start-up is a long blocking operation and it used to happen here,
+    // on the GUI thread: releasing NetworkManager, converting the interface to
+    // monitor mode, and surveying the 2.4 GHz band to find a channel. The window
+    // froze for the whole of it, so the app looked hung and the controls did
+    // nothing. None of that work touches Qt, so it goes to a worker and the
+    // event loop keeps running; the result is collected in pollStartFinished().
+    startBusy_ = true;
+    startCancel_ = false;
+    startDone_ = false;
+    startOk_ = false;
+    startErr_.clear();
+
+    startBtn_->setEnabled(false);
+    stopBtn_->setEnabled(true);   // so the wait can be cancelled
+    statusText_->setText("STARTING");
+    statusDot_->setStyleSheet("color:#FFBA42; font-size:17px;");
+    verdict_->clear();
+    pushEvent("starting sensors (this takes a few seconds)...", "#FFBA42");
+
+    startThread_ = std::thread([this] {
+        std::string err;
+        // Raw capture needs CAP_NET_RAW; engine_.start says exactly which
+        // privilege is missing rather than just failing.
+        const bool ok = engine_.start(&err);
+        // Hand the outcome over rather than touching any Qt object from here.
+        startOk_ = ok;
+        startErr_ = err;
+        startDone_ = true;
+    });
+
+    // 40 ms is quick enough to feel immediate and slow enough that a ten second
+    // start is not polled ten thousand times.
+    startPoll_.start(40);
+}
+
+void MainWindow::pollStartFinished() {
+    if (!startDone_) return;
+    startPoll_.stop();
+    joinStartWorker();
+
+    startBusy_ = false;
+
+    if (startCancel_) {
+        // Stop was pressed while the sensors were coming up.
+        engine_.stop();
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        statusText_->setText("STOPPED");
+        statusDot_->setStyleSheet("color:#688C98; font-size:17px;");
+        pushEvent("start cancelled", "#FFBA42");
+        return;
+    }
+
+    if (!startOk_) {
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        const QString e = QString::fromStdString(
+            startErr_.empty() ? "unknown error" : startErr_);
         QMessageBox::warning(
             this, "Could not start",
             QString("No sensor started.\n\n%1\n\n"
                     "Radiometric capture needs root or CAP_NET_RAW:\n"
                     "    sudo setcap cap_net_raw,cap_net_admin+eip /usr/bin/rssiradar")
-                .arg(QString::fromStdString(err.empty() ? "unknown error" : err)));
-        pushEvent("START FAILED: " + QString::fromStdString(err), "#FF5656");
+                .arg(e));
+        statusText_->setText("STOPPED");
+        statusDot_->setStyleSheet("color:#688C98; font-size:17px;");
+        pushEvent("START FAILED: " + e, "#FF5656");
         return;
     }
+
+    finishStart(true, {});
+}
+
+void MainWindow::finishStart(bool ok, std::string err) {
+    (void)ok;
+    (void)err;
     engine_.resetTracking();
     startBtn_->setEnabled(false);
     stopBtn_->setEnabled(true);
     const double hz = std::clamp(engine_.config().ui.refreshHz, 1.0, 60.0);
     pipelineTimer_.start(static_cast<int>(1000.0 / hz));
+    statusText_->setText("MONITORING");
+    statusDot_->setStyleSheet("color:#60FFA8; font-size:17px;");
     pushEvent("SENSING STARTED", "#60FFA8");
 }
 
+void MainWindow::joinStartWorker() {
+    if (startThread_.joinable()) startThread_.join();
+}
+
 void MainWindow::onStop() {
+    if (startBusy_) {
+        // The worker is still inside engine_.start(). It cannot be interrupted
+        // safely, so ask it to wind up and let pollStartFinished() do the
+        // teardown once it returns; stopping the engine from here would race it.
+        startCancel_ = true;
+        stopBtn_->setEnabled(false);
+        pushEvent("stopping; waiting for the current start to finish", "#FFBA42");
+        return;
+    }
     if (!engine_.running()) return;
     engine_.stop();
     pipelineTimer_.stop();

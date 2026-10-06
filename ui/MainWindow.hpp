@@ -3,7 +3,9 @@
 #include <QMainWindow>
 #include <QTimer>
 
+#include <atomic>
 #include <memory>
+#include <thread>
 
 #include "radar/Engine.hpp"
 
@@ -63,7 +65,7 @@ class MainWindow : public QMainWindow {
     QWidget* buildControlPanel();
     QWidget* buildPresetPanel();
     QWidget* buildAnchorPanel();
-    void refreshSensorPanel();
+    void refreshSensorPanel(const Snapshot& s);
     void refreshTelemetry(const Snapshot& s);
     void pushEvent(const QString& text, const QString& colour = QString());
     void applyTheme();
@@ -123,7 +125,31 @@ class MainWindow : public QMainWindow {
     // running; `pipelineTimer_` only drives the estimator while sensing.
     QTimer animTimer_;
     QTimer pipelineTimer_;
+    QTimer startPoll_;
+    // Signature of the last sensor-panel content, so it is only rebuilt when it
+    // actually differs.
+    QString sensorPanelSig_;
     bool tuning_ = false;
+
+    // Starting the sensors is slow and unavoidably blocking: releasing
+    // NetworkManager, converting the interface to monitor mode and surveying
+    // the band all happen inside Engine::start(). That used to run on the GUI
+    // thread, so pressing Start sensing froze the window for as long as it took
+    // -- tens of seconds. It now runs on a worker and the result is delivered
+    // back on the GUI thread.
+    std::thread startThread_;
+    std::atomic<bool> startBusy_{false};
+    std::atomic<bool> startCancel_{false};
+    // Set when the worker finishes, read by pollStartFinished() on the GUI
+    // thread, which is also what reapplies the button states.
+    bool startDone_ = false;
+    bool startOk_ = false;
+    std::string startErr_;
+    void pollStartFinished();
+    void finishStart(bool ok, std::string err);
+    // Joins a worker that is still running. Called from the destructor and from
+    // Stop, so a start in flight can never outlive the engine it is starting.
+    void joinStartWorker();
 };
 
 }  // namespace radar

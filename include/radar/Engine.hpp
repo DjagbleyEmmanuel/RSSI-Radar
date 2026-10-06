@@ -140,7 +140,16 @@ class Engine {
     // Drain sensor queues and run one pipeline iteration.
     void tick();
 
-    Snapshot snapshot() const;
+    // An immutable shared handle on the most recently published snapshot.
+    //
+    // This used to return Snapshot by value, so every consumer deep-copied the
+    // whole thing: the sample history, every per-transmitter track, the contacts,
+    // the event ring. At a 20 Hz pipeline rate that is a large allocation and
+    // memcpy several times a second, and it holds snapMtx_ for the duration,
+    // which delays the next tick. A shared_ptr makes handing a snapshot to a
+    // widget a refcount bump, and lets the previous snapshot stay valid for
+    // anything still reading it while the engine moves on.
+    std::shared_ptr<const Snapshot> snapshot() const;
 
     HardwareSurvey hardware() const;
     std::vector<Preset> presets() const;
@@ -176,6 +185,8 @@ class Engine {
     std::atomic<bool> running_{false};
     mutable std::mutex snapMtx_;
     Snapshot snap_;
+    // Published alongside snap_; this is what snapshot() hands out.
+    std::shared_ptr<const Snapshot> snapShared_;
     std::vector<RadarEvent> events_;
     std::vector<MotionMark> marks_;
 

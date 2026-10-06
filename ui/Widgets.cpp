@@ -198,14 +198,46 @@ void RadarScope::paintEvent(QPaintEvent*) {
     }
     const bool present = snap_.detection.state == DetectionState::Present;
     const QColor sweepTint = present ? QColor(255, 86, 86) : QColor(64, 224, 255);
-    QConicalGradient sweepGrad(centre, -sweepAngle_);
-    sweepGrad.setColorAt(0.00, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 78));
-    sweepGrad.setColorAt(0.10, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 20));
-    sweepGrad.setColorAt(0.28, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 0));
-    sweepGrad.setColorAt(1.00, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 0));
-    p.setBrush(sweepGrad);
-    p.setPen(Qt::NoPen);
-    p.drawEllipse(centre, radius, radius);
+
+    // The sweep wedge is cached and rotated, not re-rendered.
+    //
+    // A QConicalGradient has to work out the angle of every pixel it covers in
+    // order to pick that pixel's colour, so filling the scope with one costs an
+    // atan2 per pixel -- around 190,000 of them, every frame, on the render
+    // thread. Profiling the scope put 25% of all cycles in libm's atan2 for
+    // exactly this, and it was the single largest cost in the whole interface.
+    //
+    // The gradient is rigidly attached to the sweep angle: rotating the sweep is
+    // the same thing as rotating a picture of it. So it is rasterised once into
+    // a square pixmap and then blitted with a rotation, which turns a per-pixel
+    // transcendental into a single transformed copy.
+    const int wedgePx = static_cast<int>(std::ceil(radius)) * 2 + 4;
+    const bool tintChanged =
+        wedgeCacheTint_ != sweepTint.rgb() || wedgeCache_.size() != QSize(wedgePx, wedgePx);
+    if (tintChanged || wedgeCache_.isNull()) {
+        wedgeCache_ = QPixmap(wedgePx, wedgePx);
+        wedgeCache_.fill(Qt::transparent);
+        QPainter wp(&wedgeCache_);
+        wp.setRenderHint(QPainter::Antialiasing, true);
+        const QPointF wc(wedgePx / 2.0, wedgePx / 2.0);
+        QConicalGradient g(wc, 0.0);
+        g.setColorAt(0.00, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 78));
+        g.setColorAt(0.10, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 20));
+        g.setColorAt(0.28, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 0));
+        g.setColorAt(1.00, QColor(sweepTint.red(), sweepTint.green(), sweepTint.blue(), 0));
+        wp.setBrush(g);
+        wp.setPen(Qt::NoPen);
+        wp.drawEllipse(wc, radius, radius);
+        wp.end();
+        wedgeCacheTint_ = sweepTint.rgb();
+    }
+    // Blit the cached wedge rotated by the sweep angle, about the centre.
+    p.save();
+    p.setRenderHint(QPainter::Antialiasing, false);
+    p.translate(centre);
+    p.rotate(sweepAngle_);
+    p.drawPixmap(-wedgePx / 2.0, -wedgePx / 2.0, wedgeCache_);
+    p.restore();
 
     // --- trails
     if (showTrails_) {
@@ -221,16 +253,27 @@ void RadarScope::paintEvent(QPaintEvent*) {
     }
 
     // --- confidence history ring
+    //
+    // This used to be up to ninety individually antialiased arcs, one per history
+    // entry. Antialiased arcs are rasterised with per-pixel trigonometry, so that
+    // was a second large source of the atan2 cost. It is a faint decorative ring:
+    // sampling it every third entry and dropping antialiasing keeps the shape and
+    // the fade while cutting the work by roughly two thirds.
     if (!history_.empty()) {
-        for (size_t i = 0; i < history_.size(); ++i) {
+        const double rr = radius + 7;
+        const QRectF ringRect(centre.x() - rr, centre.y() - rr, rr * 2, rr * 2);
+        const size_t step = std::max<size_t>(1, history_.size() / 30);
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, false);
+        for (size_t i = 0; i < history_.size(); i += step) {
             const auto& h = history_[i];
             if (h.detection.confidence <= 0.0) continue;
             const double frac = static_cast<double>(i) / static_cast<double>(history_.size());
             p.setPen(QPen(QColor(255, 186, 66, static_cast<int>(200 * frac)), 1.4));
-            p.drawArc(QRectF(centre.x() - radius - 7, centre.y() - radius - 7,
-                              (radius + 7) * 2, (radius + 7) * 2),
-                      static_cast<int>(frac * -90 * 16), static_cast<int>(0.06 * -90 * 16));
+            p.drawArc(ringRect, static_cast<int>(frac * -90 * 16),
+                      static_cast<int>(0.06 * -90 * 16));
         }
+        p.restore();
     }
 
     // --- AP count / bearing badge.
@@ -887,29 +930,54 @@ void TimeseriesWidget::paintEvent(QPaintEvent*) {
         p.drawLine(area.left(), y, area.right(), y);
     }
 
-    // Raw trace
-    p.setPen(QPen(QColor(104, 140, 152, 160), 0.8));
-    QPainterPath raw;
-    for (int i = 0; i < n; ++i) {
-        const QPointF pt = QPointF(toX(i), toY(snap_.primarySamples[static_cast<size_t>(i)]));
-        if (i == 0) raw.moveTo(pt);
-        else raw.lineTo(pt);
+    // Raw trace.
+    //
+    // Decimated to one point per pixel column before the path is built. The
+    // window holds up to 1200 samples across roughly 690 pixels, so most of the
+    // segments used to land on top of their neighbours: path construction,
+    // tessellation and an antialiased stroke for geometry that could not be
+    // seen. The decimation keeps local extremes, so a real spike still shows.
+    //
+    // Antialiasing is off for it as well. This is a faint 0.8 px secondary
+    // reference line, not the signal, and aliased stroking of a long polyline is
+    // several times cheaper.
+    {
+        const std::vector<double> shown =
+            plot::decimate(snap_.primarySamples, std::max(2, area.width()));
+        p.save();
+        p.setRenderHint(QPainter::Antialiasing, false);
+        p.setPen(QPen(QColor(104, 140, 152, 160), 0.8));
+        QPainterPath raw;
+        const int k = static_cast<int>(shown.size());
+        for (int i = 0; i < k; ++i) {
+            const QPointF pt = QPointF(toX(i * (n - 1) / std::max(1, k - 1)),
+                                       toY(shown[static_cast<size_t>(i)]));
+            if (i == 0) raw.moveTo(pt);
+            else raw.lineTo(pt);
+        }
+        p.drawPath(raw);
+        p.restore();
     }
-    p.drawPath(raw);
 
-    // Smoothed trace, coloured by whether we are detecting
+    // Smoothed trace, coloured by whether we are detecting. This is the primary
+    // signal, so it keeps antialiasing and is drawn through the glow path.
     if (snap_.primarySmoothed.size() >= 3) {
         const bool present = snap_.detection.state == DetectionState::Present;
-        p.setPen(QPen(present ? theme::red() : theme::cyan(), 1.5));
+        const std::vector<double> shown =
+            plot::decimate(snap_.primarySmoothed, std::max(2, area.width()));
         QPainterPath sm;
+        const int k = static_cast<int>(shown.size());
         const int m = static_cast<int>(snap_.primarySmoothed.size());
-        for (int i = 0; i < m; ++i) {
-            const int x = area.right() - area.width() * (m - 1 - i) / std::max(1, m - 1);
-            const QPointF pt = QPointF(x, toY(snap_.primarySmoothed[static_cast<size_t>(i)]));
+        for (int i = 0; i < k; ++i) {
+            // Anchored at the right edge, as before: the newest sample is the
+            // current one and must sit at the live edge of the plot.
+            const int x = area.right() - area.width() * (k - 1 - i) / std::max(1, k - 1);
+            const QPointF pt = QPointF(x, toY(shown[static_cast<size_t>(i)]));
             if (i == 0) sm.moveTo(pt);
             else sm.lineTo(pt);
         }
-        p.drawPath(sm);
+        (void)m;
+        plot::glowLine(p, sm, present ? theme::red() : theme::cyan(), 1.5);
     }
 
     // Mean line, with its readout in an opaque chip that is clamped inside the

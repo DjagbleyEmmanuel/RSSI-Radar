@@ -139,6 +139,12 @@ class RadarScope : public QWidget {
         QRectF rect;   // padded, for hover tolerance
         QRectF box;    // the label rectangle exactly as drawn
     };
+    // Cached rasterisation of the rotating sweep wedge, plus the tint it was
+    // built for. A QConicalGradient costs an atan2 per pixel; a rotated blit does
+    // not.
+    QPixmap wedgeCache_;
+    QRgb wedgeCacheTint_ = 0;
+
     std::vector<Hit> hit_;
     uint64_t hoverId_ = 0;
     // Fixed text at the top-left of the sweep. Kept as a member rather than a

@@ -37,6 +37,11 @@ namespace {
 
 constexpr int kSolSocket = 1;
 
+// This kernel's nl80211 uapi header spells the interface types as a positional
+// enum with no "managed" member: value 2 is named NL80211_IFTYPE_STATION, and
+// referring to NL80211_IFTYPE_MANAGED does not compile. 2 is managed mode.
+constexpr uint8_t kIftypeManaged = 2;
+
 // How long the capture may produce nothing usable before the watchdog decides
 // something has gone wrong and tries to fix it. Deliberately generous: a quiet
 // band is not a fault, and recovering needlessly would itself cause churn.
@@ -350,12 +355,7 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     // that is the power-on default of channel 1 -- which is why an unresolved
     // channel has to be treated as a hard error rather than a fallback.
     autoChannel_ = cfg.radio.wifiChannel;
-    if (autoChannel_ <= 0) {
-        std::string info;
-        runCapture("iw dev " + iface_ + " info", &info);
-        const size_t k = info.find("channel ");
-        if (k != std::string::npos) autoChannel_ = std::atoi(info.c_str() + k + 8);
-    }
+    if (autoChannel_ <= 0) nl80211GetInterface(&autoChannel_, nullptr, nullptr);
     if (autoChannel_ <= 0) autoChannel_ = forceReassociate();
 
     // A channel is only really known if configuration, an association or a scan
@@ -370,13 +370,15 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     // itself, so repair it rather than only reporting it.
     if (autoChannel_ <= 0) {
         std::string info;
-        runCapture("iw dev " + iface_ + " info", &info);
         // `iw dev info` reports "type managed" even for a device NetworkManager
         // has released, so the authoritative test is NetworkManager's own view.
         // The field is GENERAL.NM-MANAGED; GENERAL.MANAGED is rejected by nmcli
         // as an invalid field, which made this whole recovery unreachable.
-        if (info.find("unmanaged") != std::string::npos ||
-            runCapture("nmcli -t -f GENERAL.NM-MANAGED device show " + iface_, &info) == 0) {
+        //
+        // This runs once, not in a loop, so the single subprocess here is cheap
+        // and there was no reason to add a netlink path that would answer it
+        // less completely.
+        if (runCapture("nmcli -t -f GENERAL.NM-MANAGED device show " + iface_, &info) == 0) {
             std::string out;
             runCapture("nmcli device set " + iface_ + " managed yes", &out);
             note("reclaimed " + iface_ + " from a previous run (was unmanaged)");
@@ -420,10 +422,6 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     }
 
     if (cfg.radio.autoMonitorMode && hasNetAdminPrivilege()) {
-        // With no channel resolved yet, sit on channel 1 so the capture thread
-        // is running and the band sweep has something to count. The sweep then
-        // moves the synthesiser and picks the productive channel.
-        if (autoChannel_ <= 0) autoChannel_ = 1;
         std::string report = "no attempt made";
         for (int attempt = 1; attempt <= 3; ++attempt) {
             // 0 means "read the channel from the associated access point", which
@@ -431,7 +429,23 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
             report = enterMonitorMode(cfg.radio.wifiChannel, true);
             if (report.empty()) {
                 if (!openSocket(err)) return false;
-                const bool got = waitForRadiometricFrame(3000);
+
+                // Only wait for frames when the channel is actually known.
+                //
+                // With no channel resolved, this used to park on channel 1 as a
+                // placeholder and then wait three seconds for a radiotap frame,
+                // three times over, before the band sweep ran. Channel 1 is a
+                // guess: it is the synthesiser's power-on default, not where
+                // anything is. On a machine whose access points were elsewhere
+                // every one of those nine seconds was spent waiting for frames
+                // that were never coming on that channel, and the sweep that
+                // would have found the real one had not run yet.
+                //
+                // So when the channel is unknown, get into monitor mode and sweep
+                // first, then come back and confirm frames on the channel the
+                // sweep actually chose.
+                const bool confirmFrames = !needSweep;
+                const bool got = confirmFrames ? waitForRadiometricFrame(3000) : true;
                 closeSocket();
                 if (got) {
                     monitorMode_ = true;
@@ -453,7 +467,16 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     std::string sweepSummary;
     if (needSweep) {
         const int found = sweepBand(900, &sweepSummary);
-        if (found > 0) autoChannel_ = found;
+        if (found > 0) {
+            autoChannel_ = found;
+            // Confirm the card really does deliver on the channel the sweep chose,
+            // now that the channel is not a guess.
+            if (monitorMode_ && openSocket(err)) {
+                if (waitForRadiometricFrame(2500)) note("capture confirmed on channel " +
+                                                       std::to_string(found));
+                closeSocket();
+            }
+        }
     }
 
     if (needSweep && autoChannel_ <= 0) {
@@ -952,6 +975,140 @@ uint32_t channelToFreqMhz(int ch) {
 
 }  // namespace
 
+// Read interface state over nl80211 in one round trip.
+//
+// NL80211_CMD_GET_INTERFACE answers with the attributes the kernel already has,
+// including the frequency the interface is tuned to. Parsing that directly
+// replaces `iw dev <iface> info`, whose text format this code was scraping for
+// a "channel " substring -- on the start-up path, in a poll loop, sixty times.
+int WifiRadiometricSensor::nl80211GetInterface(int* channel, uint8_t* iftype,
+                                               uint32_t* wiphy,
+                                               std::string* ssid) const {
+    if (channel) *channel = 0;
+    if (iftype) *iftype = 0;
+    if (wiphy) *wiphy = 0;
+    if (ssid) ssid->clear();
+
+    const int ifIdx = ::if_nametoindex(iface_.c_str());
+    if (ifIdx <= 0) return -ENODEV;
+
+    const uint16_t family = nl80211FamilyId();
+    if (family == 0) return -EOPNOTSUPP;
+
+    char buf[256] = {};
+    auto* n = reinterpret_cast<nlmsghdr*>(buf);
+    n->nlmsg_len = NLMSG_LENGTH(sizeof(genlmsghdr));
+    n->nlmsg_type = family;
+    n->nlmsg_flags = NLM_F_REQUEST;
+    const uint32_t seq = seqCounter();
+    n->nlmsg_seq = seq;
+
+    auto* g = reinterpret_cast<genlmsghdr*>(NLMSG_DATA(n));
+    g->cmd = static_cast<__u8>(NL80211_CMD_GET_INTERFACE);
+    g->version = 0;  // matches what iw sends
+
+    const int idx = ifIdx;
+    const size_t off = NLMSG_ALIGN(n->nlmsg_len);
+    auto* a = reinterpret_cast<nlattr*>(buf + off);
+    a->nla_type = NL80211_ATTR_IFINDEX;
+    a->nla_len = static_cast<__u16>(NLA_HDRLEN + sizeof(idx));
+    std::memcpy(NLA_DATA(a), &idx, sizeof(idx));
+    n->nlmsg_len = static_cast<__u32>(off + NLA_HDRLEN + NLA_ALIGN(sizeof(idx)));
+
+    const int fd = netlinkSocketBounded();
+    if (fd < 0) return errno ? errno : -ENOSYS;
+
+    sockaddr_nl sa{};
+    sa.nl_family = AF_NETLINK;
+
+    int rc = 0;
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
+        rc = errno;
+    } else if (::send(fd, buf, n->nlmsg_len, 0) < 0) {
+        rc = errno;
+    } else {
+        // Short bound: this is called from poll loops, and a kernel that has
+        // gone quiet must not turn into an unbounded block.
+        timeval tv{};
+        tv.tv_sec = 0;
+        tv.tv_usec = 250000;
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char rbuf[4096];
+        for (;;) {
+            const ssize_t got = ::recv(fd, rbuf, sizeof(rbuf), 0);
+            if (got < 0) {
+                if (errno == EINTR) continue;
+                rc = errno;
+                break;
+            }
+            if (got == 0) {
+                rc = -ETIMEDOUT;
+                break;
+            }
+
+            ssize_t left = got;
+            auto* h = reinterpret_cast<nlmsghdr*>(rbuf);
+            for (; NLMSG_OK(h, static_cast<unsigned>(left)); h = NLMSG_NEXT(h, left)) {
+                if (h->nlmsg_seq != seq) continue;  // not ours
+                if (h->nlmsg_type == NLMSG_ERROR) {
+                    const auto* e = static_cast<const nlmsgerr*>(NLMSG_DATA(h));
+                    rc = e->error;
+                    break;
+                }
+                if (h->nlmsg_type == NLMSG_DONE) {
+                    rc = 0;
+                    break;
+                }
+                if (h->nlmsg_type != family) continue;
+
+                // Walk the attributes of the reply.
+                auto* g2 = reinterpret_cast<genlmsghdr*>(NLMSG_DATA(h));
+                auto* ta = reinterpret_cast<nlattr*>(NLMSG_DATA(g2) + NLMSG_ALIGN(sizeof(genlmsghdr)));
+                size_t tlen = h->nlmsg_len - NLMSG_LENGTH(sizeof(genlmsghdr));
+                // nla_ok()/nla_next() are kernel-side helpers and are not
+                // available in a userspace build, so the walk is done by hand.
+                while (tlen >= sizeof(nlattr) && ta->nla_len >= sizeof(nlattr) &&
+                       ta->nla_len <= tlen) {
+                    switch (ta->nla_type) {
+                        case NL80211_ATTR_IFTYPE:
+                            if (iftype && ta->nla_len >= NLA_HDRLEN + 1)
+                                *iftype = *static_cast<const uint8_t*>(NLA_DATA(ta));
+                            break;
+                        case NL80211_ATTR_WIPHY:
+                            if (wiphy && ta->nla_len >= NLA_HDRLEN + sizeof(uint32_t)) {
+                                uint32_t v = 0;
+                                std::memcpy(&v, NLA_DATA(ta), sizeof(v));
+                                *wiphy = v;
+                            }
+                            break;
+                        case NL80211_ATTR_SSID:
+                            if (ssid && ta->nla_len > NLA_HDRLEN)
+                                ssid->assign(static_cast<const char*>(NLA_DATA(ta)),
+                                             ta->nla_len - NLA_HDRLEN);
+                            break;
+                        case NL80211_ATTR_WIPHY_FREQ:
+                            if (channel && ta->nla_len >= NLA_HDRLEN + sizeof(uint32_t)) {
+                                uint32_t khz = 0;
+                                std::memcpy(&khz, NLA_DATA(ta), sizeof(khz));
+                                if (khz >= 2412 && khz <= 2472) *channel = (khz - 2407) / 5;
+                            }
+                            break;
+                        default:
+                            break;
+                    }
+                    tlen -= NLA_ALIGN(ta->nla_len);
+                    ta = reinterpret_cast<nlattr*>(reinterpret_cast<char*>(ta) +
+                                                    NLA_ALIGN(ta->nla_len));
+                }
+            }
+            break;  // one reply is enough
+        }
+    }
+    ::close(fd);
+    return rc;
+}
+
 // Pin the synthesiser. This uapi header has no NL80211_ATTR_WIPHY_CHANNEL, so
 // the centre frequency goes out as NL80211_ATTR_WIPHY_FREQ alongside the channel
 // width. SIOCSIWCHAN is not an option: iwlwifi answers EOPNOTSUPP. The unit is
@@ -976,12 +1133,7 @@ std::string WifiRadiometricSensor::enterMonitorMode(int chan, bool pinChannel) {
     // Read the channel while the link is still UP: once it is down, iw reports
     // no channel at all and there is nothing to follow.
     int follow = autoChannel_;
-    if (follow <= 0) {
-        std::string pre;
-        runCapture("iw dev " + iface_ + " info", &pre);
-        const size_t k = pre.find("channel ");
-        if (k != std::string::npos) follow = std::atoi(pre.c_str() + k + 8);
-    }
+    if (follow <= 0) nl80211GetInterface(&follow, nullptr, nullptr);
 
     ifreq r{};
     std::strncpy(r.ifr_name, iface_.c_str(), IFNAMSIZ - 1);
@@ -1007,10 +1159,15 @@ std::string WifiRadiometricSensor::enterMonitorMode(int chan, bool pinChannel) {
     if (::ioctl(ctl, SIOCSIFFLAGS, &u) != 0) return "could not bring the link up";
 
     // Give the firmware a moment to pick a channel of its own, then pin ours.
+    //
+    // This used to shell out to `iw dev info` ten times with 200 ms sleeps --
+    // twenty forks and two seconds of start-up latency -- to wait for a
+    // condition the kernel already knows about. The netlink query answers it in
+    // microseconds, so the loop now costs nothing and the timeout is only a
+    // backstop for a card that never reports a frequency.
     for (int i = 0; i < 10; ++i) {
-        std::string info;
-        runCapture("iw dev " + iface_ + " info", &info);
-        if (info.find("channel") != std::string::npos) break;
+        int seen = 0;
+        if (nl80211GetInterface(&seen, nullptr, nullptr) == 0 && seen > 0) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
     // Only pin a channel when the operator asked for a specific one. This
@@ -1046,10 +1203,8 @@ std::string WifiRadiometricSensor::enterMonitorMode(int chan, bool pinChannel) {
     // captures. The only honest test is whether a frame arrives, which the
     // caller does with waitForFirstFrame().
     {
-        std::string now;
-        runCapture("iw dev " + iface_ + " info", &now);
-        const size_t k = now.find("channel ");
-        const int on = k != std::string::npos ? std::atoi(now.c_str() + k + 8) : 0;
+        int on = 0;
+        nl80211GetInterface(&on, nullptr, nullptr);
         // This driver routinely omits the channel line for a monitor interface
         // while delivering frames perfectly well, so "channel 0" said nothing
         // useful. Report the target we asked for and, separately, whether the
@@ -1396,10 +1551,14 @@ void WifiRadiometricSensor::reclaimStaleInterfaces() {
     // association and the channel are forceReassociate()'s job, and waiting for
     // a channel that will never appear on an empty band just burned six seconds
     // on every start.
+    // Ten iterations of a subprocess poll with 200 ms sleeps: another twenty
+    // forks and two seconds on the start-up path, to watch a type change the
+    // kernel will report instantly. Netlink answers in microseconds; the sleeps
+    // remain only as a backstop.
     for (int i = 0; i < 10; ++i) {
-        std::string state;
-        runCapture("iw dev " + iface_ + " info", &state);
-        if (state.find("type managed") != std::string::npos) break;
+        uint8_t type = 0;
+        if (nl80211GetInterface(nullptr, &type, nullptr) == 0 && type == kIftypeManaged)
+            break;
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
 
@@ -1425,17 +1584,14 @@ void WifiRadiometricSensor::rememberCurrentNetwork() {
     savedProfile_.clear();
     savedSsid_.clear();
 
-    // The SSID the radio is actually associated with.
-    std::string info;
-    runCapture("iw dev " + iface_ + " info", &info);
-    const size_t s = info.find("ssid ");
-    if (s != std::string::npos) {
-        size_t e = info.find('\n', s);
-        if (e == std::string::npos) e = info.size();
-        savedSsid_ = info.substr(s + 5, e - s - 5);
-        while (!savedSsid_.empty() && std::isspace(static_cast<unsigned char>(savedSsid_.back())))
-            savedSsid_.pop_back();
-    }
+    // The SSID the radio is actually associated with, straight from the kernel.
+    // It used to come from scraping `iw dev info` for an "ssid " line, one more
+    // fork on the start-up path, for a field nl80211 already sends.
+    std::string ifssid;
+    nl80211GetInterface(nullptr, nullptr, nullptr, &ifssid);
+    while (!ifssid.empty() && std::isspace(static_cast<unsigned char>(ifssid.back())))
+        ifssid.pop_back();
+    savedSsid_ = ifssid;
 
     // The profile NetworkManager currently has active on this device.
     std::string active;
@@ -1490,22 +1646,32 @@ int WifiRadiometricSensor::forceReassociate() {
         note("no previously active network to rejoin; scanning instead");
     }
 
-    // A profile that exists will associate in a second or two. With nothing
-    // targeted there is no reason to wait the full twenty seconds.
-    const int attempts = haveProfile ? 40 : 12;
+    // Wait for the association, if one was actually requested.
+    //
+    // Two things were wrong with the original loop. It shelled out to
+    // `iw dev info` on every iteration, so each poll cost a fork, a shell and a
+    // second exec; and it ran the full twelve iterations (six seconds) even
+    // when no profile had been targeted at all, in which case NetworkManager was
+    // never asked to associate and nothing was ever going to appear. The whole
+    // of that six seconds was dead time on the start-up path, and it was all
+    // spent on the GUI thread, which is why pressing Start sensing froze the
+    // window.
+    //
+    // Now: no subprocess, a 100 ms poll so a successful association is picked up
+    // promptly, and no wait at all when there was no profile to join -- the band
+    // sweep is the reliable route to a channel when nothing is associated, and
+    // it is only a few seconds away.
+    const int attempts = haveProfile ? 30 : 2;
     for (int i = 0; i < attempts; ++i) {
-        std::string info;
-        runCapture("iw dev " + iface_ + " info", &info);
-        const size_t k = info.find("channel ");
-        if (info.find("type managed") != std::string::npos && k != std::string::npos) {
-            const int ch = std::atoi(info.c_str() + k + 8);
-            if (ch > 0) {
-                note("reassociated on channel " + std::to_string(ch) +
-                     (haveProfile ? " on " + savedProfile_ : std::string()));
-                return ch;
-            }
+        int ch = 0;
+        uint8_t type = 0;
+        if (nl80211GetInterface(&ch, &type, nullptr) == 0 && type == kIftypeManaged &&
+            ch > 0) {
+            note("reassociated on channel " + std::to_string(ch) +
+                 (haveProfile ? " on " + savedProfile_ : std::string()));
+            return ch;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     if (haveProfile) note("could not rejoin " + savedProfile_ + "; scanning");

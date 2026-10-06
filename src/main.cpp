@@ -190,7 +190,9 @@ int capture(double seconds, const QString& cfgPath) {
     uint64_t lastSeen = 0;
     while (std::chrono::duration<double>(Clock::now() - start).count() < seconds) {
         engine.tick();
-        const Snapshot s = engine.snapshot();
+        const auto sp = engine.snapshot();
+        if (!sp) continue;  // nothing published yet this tick
+        const Snapshot& s = *sp;
         if (s.totalObservations != lastSeen) {
             lastSeen = s.totalObservations;
             std::printf("[%5.1fs] obs=%-8llu rate=%6.1f Hz  primary=%-28s "
@@ -203,8 +205,14 @@ int capture(double seconds, const QString& cfgPath) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1000 / hz));
     }
-    const Snapshot s = engine.snapshot();
+    // engine.stop() restores NetworkManager and hands the interface back, so it
+    // runs before anything that can leave. Returning early above would leave the
+    // device released from NetworkManager and the next start would find it
+    // unmanaged.
+    const auto sp = engine.snapshot();
     engine.stop();
+    if (!sp) return 0;
+    const Snapshot& s = *sp;
 
     std::printf("\n--- sensor status ---\n");
     for (const auto& st : s.sensors) {
@@ -325,7 +333,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName("rssiradar");
-    QCoreApplication::setApplicationVersion("1.4.3");
+    QCoreApplication::setApplicationVersion("1.4.4");
 
     QCommandLineParser parser;
     parser.setApplicationDescription(

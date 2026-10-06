@@ -229,6 +229,23 @@ class WifiRadiometricSensor : public ISensor {
     int nl80211SetInterfaceType(uint8_t iftype);
     // Pin the synthesiser to a channel. 0 on success, -EBUSY when already tuned.
     int nl80211SetChannel(int phy, int channel);
+
+    // Read the interface's current type, channel and phy directly over nl80211.
+    //
+    // This replaces shelling out to `iw dev <iface> info` and parsing its text.
+    // That cost a fork, an exec of /bin/sh and a second exec of iw on every
+    // call, and it was called in polling loops on the start-up path: a single
+    // `Start sensing` spawned around sixty iw processes. The answer only needs
+    // one netlink round trip.
+    //
+    // Returns 0 on success. *channel is left at 0 when the kernel reports no
+    // frequency, which is what an unassociated interface looks like -- the same
+    // condition `iw dev info` shows as no "channel" line.
+    // ssid, when given, receives the associated network's SSID -- which the
+    // kernel reports alongside the frequency, so remembering the current network
+    // no longer needs `iw dev info` either.
+    int nl80211GetInterface(int* channel, uint8_t* iftype, uint32_t* wiphy,
+                            std::string* ssid = nullptr) const;
     uid_t getpwnam_real_uid() const;
     // One recovery attempt when capture has gone quiet. Returns true if the
     // interface was reconfigured and the caller should keep going.

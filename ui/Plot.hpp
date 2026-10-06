@@ -71,8 +71,60 @@ inline qreal mapX(const QRectF& area, int index, int count) {
 // exactly through every sample (so peaks are not rounded away) while still
 // reading as smooth -- a naive lineTo looks jagged, and a low-order polynomial
 // fit invents peaks that are not in the data.
+// Reduce a series to at most one point per pixel column, keeping local extremes.
+//
+// The plots were being handed the full sample history -- 1200 points for a
+// received-power window -- and turning every one of it into a cubic segment,
+// only to draw them into a widget 740 px wide. Segments thinner than a pixel
+// cannot be seen, so they are pure cost: path construction, tessellation and
+// stroking for geometry that lands on top of its neighbours.
+//
+// Each output point keeps whichever extreme of its bucket matters for the
+// direction of travel: the minimum for a rising bucket and the maximum for a
+// falling one. That is a min/max decimation, so a genuine spike in the data
+// still reaches the screen instead of being averaged away, which is the failure
+// mode that makes naive subsampling unacceptable for a detector's display.
+inline std::vector<double> decimate(const std::vector<double>& v, int maxPoints) {
+    const int n = static_cast<int>(v.size());
+    if (maxPoints < 2 || n <= maxPoints) return v;
+
+    std::vector<double> out;
+    out.reserve(static_cast<size_t>(maxPoints) + 2);
+
+    const double scale = static_cast<double>(n) / static_cast<double>(maxPoints);
+    double prev = v.front();
+    for (int k = 0; k < maxPoints; ++k) {
+        int lo = static_cast<int>(std::floor(static_cast<double>(k) * scale));
+        int hi = static_cast<int>(std::floor(static_cast<double>(k + 1) * scale));
+        if (hi <= lo) hi = lo + 1;
+        if (lo >= n) break;
+        if (hi > n) hi = n;
+
+        int best = lo;
+        const bool rising = prev <= v[lo];
+        for (int j = lo + 1; j < hi; ++j) {
+            if (rising ? (v[j] < v[best]) : (v[j] > v[best])) best = j;
+        }
+        out.push_back(v[best]);
+        prev = v[best];
+    }
+    if (!v.empty() && (out.empty() || out.back() != v.back())) out.push_back(v.back());
+    return out;
+}
+
+inline QPainterPath smoothPathRaw(const QRectF& area, const std::vector<double>& v, double lo,
+                                 double hi);
+
+// smoothPath, but never handed more points than the widget has pixels to show.
+// maxPoints <= 0 means "two per pixel column".
 inline QPainterPath smoothPath(const QRectF& area, const std::vector<double>& v, double lo,
-                               double hi) {
+                               double hi, int maxPoints = 0) {
+    if (maxPoints <= 0) maxPoints = std::max(2, static_cast<int>(area.width()) * 2);
+    return smoothPathRaw(area, decimate(v, maxPoints), lo, hi);
+}
+
+inline QPainterPath smoothPathRaw(const QRectF& area, const std::vector<double>& v, double lo,
+                                 double hi) {
     QPainterPath path;
     const int n = static_cast<int>(v.size());
     if (n == 0) return path;
@@ -132,18 +184,30 @@ inline void gradientFill(QPainter& p, const QPainterPath& curve, const QRectF& a
 // The operator's trace-weight control is applied here rather than at each call
 // site, because it had been plumbed all the way to the slider and then never
 // actually multiplied anything.
+// The halo is drawn without antialiasing.
+//
+// Antialiased stroking costs roughly two to three times an aliased stroke, and
+// this function was stroking one long cubic path four times with AA enabled:
+// three translucent halo layers plus the core. On a 1200-segment trace that made
+// it the single most expensive thing any widget did -- 11.3 ms for a 340x300
+// spectrum, and 5-6 ms for the scope and the received-power plot.
+//
+// The halo layers are wide and low-alpha, so there is no visible stair-stepping
+// to lose by dropping AA on them; only the thin core keeps it, because that one
+// is a hard edge and it is cheap next to the halo. Together with one fewer layer
+// this is a large cut in per-frame cost for a difference you cannot see.
 inline void glowLine(QPainter& p, const QPainterPath& curve, const QColor& c, qreal width = 1.8,
-                     int layers = 3) {
+                     int layers = 2) {
     if (curve.isEmpty()) return;
     p.save();
     p.setBrush(Qt::NoBrush);
-    p.setRenderHint(QPainter::Antialiasing, true);
 
     const qreal core = std::max<qreal>(0.8, width * traceScale());
     // Outer edge of the halo, as a multiple of the core width.
     const qreal reach = std::max<qreal>(0.6, core * 1.5);
 
     // Widest first, so the narrower, brighter layers composite on top.
+    p.setRenderHint(QPainter::Antialiasing, false);
     for (int i = layers; i >= 1; --i) {
         const qreal f = static_cast<qreal>(i) / layers;  // 1 = outermost
         const qreal w = core + reach * f;
@@ -153,6 +217,9 @@ inline void glowLine(QPainter& p, const QPainterPath& curve, const QColor& c, qr
         p.setPen(QPen(g, w, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         p.drawPath(curve);
     }
+
+    // The core is the visible line, so it keeps its antialiasing.
+    p.setRenderHint(QPainter::Antialiasing, true);
     p.setPen(QPen(c, core, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
     p.drawPath(curve);
     p.restore();
