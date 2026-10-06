@@ -33,26 +33,27 @@ all of it at runtime.
 
 ### On the CSI question specifically
 
-The Nexmon issue you found is real and worth reading, but it does not apply to
-this machine as-is. Verified here:
+Intel's `iwlwifi` driver carries the CSI machinery in its firmware-facing module
+— `CSI_CHUNKS_NOTIFICATION`, `CSI_HEADER_NOTIFICATION`, `notify_mcsi`,
+`IWL_UCODE_TLV_CAPA_CSI_REPORTING` — but that is not the same as having a way to
+reach it. On a stock kernel there is no userspace path:
 
-* `iwlmvm.ko` **does** contain the CSI machinery — `CSI_CHUNKS_NOTIFICATION`,
-  `CSI_HEADER_NOTIFICATION`, `notify_mcsi`, `IWL_UCODE_TLV_CAPA_CSI_REPORTING`.
-* But **`NL80211_ATTR_VENDOR_COMMANDS` is absent from this kernel's uapi
-  header**, and `iw phy` therefore lists no supported vendor commands at all.
-  There is no userspace path to the firmware's mCSI notifications.
+- `NL80211_ATTR_VENDOR_COMMANDS` is absent from the uapi header this kernel
+  ships, so `iw phy` lists no supported vendor commands at all. There is nothing
+  for a program to send and nothing for it to receive on.
+- Intel's out-of-tree `backport-iwlwifi` tree does expose the CSI vendor command,
+  so installing it via DKMS is the route in principle — provided the chip's
+  firmware advertises the capability. That has not been demonstrated on the
+  867 Mbps 7265.
 
-That issue points at Intel's **out-of-tree `backport-iwlwifi`** tree, and the
-published result (Zubow/Gawlowicz/Dressler) used an **Intel 9260** with a driver
-backported onto kernel 5.5.1. Getting CSI here would mean installing
-`backport-iwlwifi` via DKMS on a chip whose firmware advertises the capability —
-and it was never demonstrated on the 867 Mbps 7265.
+So CSI is reported unavailable with the reason stated, rather than probed for
+optimistically and reported as working.
 
-`CsiSensor` therefore probes for three real backends at runtime and reports
-which one, if any, is present:
+`CsiSensor` probes for three real backends at runtime and reports which one, if
+any, is present:
 
 1. Atheros with a CSI-capable driver (`ath10k_csi` / `nexmon` generic-netlink family)
-2. Intel exposing `IWL_MVM_VENDOR_CMD_CSI_EVENT` (only in the backport tree)
+2. Intel exposing `IWL_MVM_VENDOR_CMD_CSI_EVENT` (backport tree only)
 3. Otherwise unavailable, with the reason stated
 
 Plug in a ~$15 ath10k/ath9k dongle and the same downstream pipeline lights up
