@@ -2,6 +2,7 @@
 #pragma once
 
 #include <QColor>
+#include <QString>
 #include <QPushButton>
 #include <QWidget>
 
@@ -86,10 +87,34 @@ class RadarScope : public QWidget {
     void setShowGrid(bool g) { showGrid_ = g; }
     void setShowTrails(bool t) { showTrails_ = t; }
 
+    // Test hook: number of pairs of drawn contact labels that overlap. Zero is
+    // the requirement; eyeballing a screenshot is not a sufficient check.
+    int labelOverlaps() const {
+        int n = 0;
+        // Compared on the drawn geometry, not the padded hover rectangle.
+        for (size_t i = 0; i < hit_.size(); ++i)
+            for (size_t j = i + 1; j < hit_.size(); ++j)
+                if (hit_[i].box.intersects(hit_[j].box)) ++n;
+        return n;
+    }
+
   protected:
     void paintEvent(QPaintEvent*) override;
+    void mouseMoveEvent(QMouseEvent*) override;
+    void leaveEvent(QEvent*) override;
 
   private:
+    // Where each contact ended up on screen, so hovering can name it.
+    struct Hit {
+        uint64_t id = 0;
+        QRectF rect;   // padded, for hover tolerance
+        QRectF box;    // the label rectangle exactly as drawn
+        QString text;
+    };
+    std::vector<Hit> hit_;
+    QString lastTip_;
+    // Channel currently being listened to, shown in the hover readout.
+
     struct Blip {
         QPointF pos;
         double confidence = 0;

@@ -235,6 +235,17 @@ broken:
   time the detector trips, labelled with its range and age, and fades over its
   lifetime. A sequence of trips leaves a trail showing where activity has been.
 
+Contacts are labelled **AP**, not "#1". A tracking id is an internal handle and
+tells an operator nothing about what the blip *is*; several blips all reading
+"#1", "#2" looked like a bug rather than a design. Hovering a contact names it,
+with its range and level.
+
+Labels are placed by trying candidate positions in order and only cascading when
+all of them collide, so contacts cannot stack on one another.
+`tests/ui/scope_declutter_test.cpp` renders twenty deliberately colliding contacts
+and asserts that zero label pairs overlap — an eyeball check on a screenshot is
+not a sufficient test for this.
+
 RSSI gives one number per transmitter per moment. From one receiver and one
 access point there is no way to locate a *person*: there is nothing to triangulate
 and no phase to work with. What can be shown honestly is where the energy is

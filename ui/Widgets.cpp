@@ -4,6 +4,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QToolTip>
 #include <QMouseEvent>
 #include <QPainterPath>
 #include <QTimerEvent>
@@ -55,6 +56,39 @@ void drawGrid(QPainter& p, const QRect& r, int cols, int rows) {
 RadarScope::RadarScope(QWidget* parent) : QWidget(parent) {
     setMinimumSize(360, 360);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setMouseTracking(true);
+    setToolTip("Hover a contact for its identity");
+}
+
+void RadarScope::mouseMoveEvent(QMouseEvent* e) {
+    const QPointF pos = e->position();
+    const Hit* found = nullptr;
+    for (const auto& h : hit_)
+        if (h.rect.contains(pos)) {
+            found = &h;
+            break;
+        }
+    if (found) {
+        if (found->text != lastTip_) {
+            lastTip_ = found->text;
+            QToolTip::showText(e->globalPosition().toPoint(), lastTip_, this);
+        }
+        setCursor(Qt::PointingHandCursor);
+    } else {
+        if (!lastTip_.isEmpty()) {
+            lastTip_.clear();
+            QToolTip::hideText();
+        }
+        setCursor(Qt::ArrowCursor);
+    }
+    QWidget::mouseMoveEvent(e);
+}
+
+void RadarScope::leaveEvent(QEvent* e) {
+    lastTip_.clear();
+    hit_.clear();
+    QToolTip::hideText();
+    QWidget::leaveEvent(e);
 }
 
 void RadarScope::setRangeMetres(double r) {
@@ -330,6 +364,7 @@ void RadarScope::paintEvent(QPaintEvent*) {
             bool displaced = false;
         };
         std::vector<Placed> placed;
+        hit_.clear();
 
         // Priority: the primary first, then whoever is being heard most strongly
         // and most recently, so the blips that matter keep their true position
@@ -434,63 +469,108 @@ void RadarScope::paintEvent(QPaintEvent*) {
             placed.push_back({truePos, pos, c, displaced});
         }
 
-        // Labels, stacked so they never overlap each other or a blip. Each is
-        // tied to its blip by a short leader, which is what keeps the mapping
-        // readable once several have been decluttered.
+        // Labels, placed so they never overlap each other or a blip.
+        //
+        // The previous version nudged each label downward until it found space
+        // and then wrapped to the right at the bottom of the scope, which dropped
+        // it straight on top of another label. Rendering nine deliberately
+        // colliding contacts showed three overlaps that way. Candidate positions
+        // are now tried in order -- right, left, above, below -- and only if all
+        // of them collide does the label cascade, and the cascade itself no longer
+        // wraps sideways into occupied space.
         p.setFont(QFont(font().family(), 8));
         const QFontMetrics fm(p.font());
         std::vector<QRectF> taken;
+        for (const auto& pl : placed)
+            taken.push_back(QRectF(pl.shownPos.x() - 7, pl.shownPos.y() - 7, 14, 14));
+
+        const auto clear = [&](const QRectF& r) {
+            for (const auto& t : taken)
+                if (t.intersects(r)) return false;
+            return true;
+        };
+
+        // Pack from the top down so the first label takes the best slot.
+        std::sort(placed.begin(), placed.end(), [](const Placed& a2, const Placed& b2) {
+            return a2.shownPos.y() < b2.shownPos.y();
+        });
+
         for (const auto& pl : placed) {
             const Contact* c = pl.c;
             const double range = c->rangeValid ? c->rangeM : rangeFromDbm(c->levelDbm);
             const QColor base = theme::forMac(macHash(c->mac));
             const int alpha = static_cast<int>(255 * std::clamp(c->presence, 0.0, 1.0));
 
-            QString tag = QStringLiteral("#%1").arg(c->id);
-            if (pl.displaced || rangeM_ <= range)
+            QString tag = QStringLiteral("AP");
+            if (pl.displaced || ringRange <= range)
                 tag += QStringLiteral(" %1m").arg(range, 0, 'f', 1);
-            if (c->state != ContactState::Active) tag += QStringLiteral(" %1").arg(toString(c->state));
-            if (!c->bearingValid) tag += QStringLiteral("·");  // bearing unknown
+            if (c->state != ContactState::Active)
+                tag += QStringLiteral(" %1").arg(toString(c->state));
+            if (!c->bearingValid) tag += QStringLiteral("·");
 
-            const qreal tw = fm.horizontalAdvance(tag) + 6;
+            const qreal tw = fm.horizontalAdvance(tag) + 8;
             const qreal th = fm.height() + 2;
-            QRectF box(pl.shownPos.x() + 7, pl.shownPos.y() - th - 2, tw, th);
+            const QPointF anchor = pl.shownPos;
 
-            // Nudge down until it finds clear space, then sideways if needed.
-            for (int guard = 0; guard < 40; ++guard) {
-                bool clash = false;
-                for (const auto& r : taken)
-                    if (r.intersects(box)) {
-                        clash = true;
-                        break;
-                    }
-                if (!clash)
-                    for (const auto& q : placed) {
-                        const QRectF br(q.shownPos.x() - 8, q.shownPos.y() - 8, 16, 16);
-                        if (br.intersects(box)) {
-                            clash = true;
-                            break;
-                        }
-                    }
-                if (!clash) break;
-                box.moveTop(box.top() + th - 1);
-                if (box.bottom() > height() - 4) {
-                    box.moveTop(4);
-                    box.moveLeft(box.left() + tw + 4);
+            // Candidates in preference order, all kept inside the widget.
+            std::vector<QRectF> cands = {
+                QRectF(anchor.x() + 7, anchor.y() - th - 1, tw, th),
+                QRectF(anchor.x() - 7 - tw, anchor.y() - th - 1, tw, th),
+                QRectF(anchor.x() + 7, anchor.y() + 2, tw, th),
+                QRectF(anchor.x() - 7 - tw, anchor.y() + 2, tw, th),
+                QRectF(anchor.x() - tw / 2, anchor.y() - th - 7, tw, th),
+            };
+            QRectF box;
+            bool placed2 = false;
+            for (auto cand : cands) {
+                if (cand.left() < 2 || cand.top() < 2) continue;
+                if (cand.right() > width() - 2 || cand.bottom() > height() - 2) continue;
+                if (clear(cand)) {
+                    box = cand;
+                    placed2 = true;
+                    break;
                 }
             }
+            if (!placed2) {
+                // Every preferred slot is occupied: cascade downward from the
+                // anchor, and keep going down until something is clear. Never wrap
+                // sideways, which is what caused the overlaps.
+                box = QRectF(anchor.x() + 7, anchor.y() - th - 1, tw, th);
+                for (int step = 0; step < 60; ++step) {
+                    if (box.top() >= 2 && box.bottom() <= height() - 2 && clear(box)) {
+                        placed2 = true;
+                        break;
+                    }
+                    box.moveTop(box.top() + th);
+                    if (box.bottom() > height() - 2) {
+                        box.moveTop(2);
+                        box.moveLeft(box.left() + tw + 3);
+                    }
+                }
+            }
+            if (!placed2) continue;
             taken.push_back(box);
 
             p.setPen(QPen(QColor(base.red(), base.green(), base.blue(),
                                  std::max(40, alpha / 3)),
                           1));
-            p.drawLine(QPointF(pl.shownPos.x() + 1, pl.shownPos.y()), box.topLeft());
+            p.drawLine(anchor, box.center());
 
             p.setPen(QColor(base.red(), base.green(), base.blue(), alpha));
-            p.fillRect(box, QColor(6, 12, 16, 190));
+            p.fillRect(box, QColor(6, 12, 16, 215));
             p.drawRect(box);
             p.setPen(QColor(226, 242, 248, alpha));
             p.drawText(box, Qt::AlignCenter, tag);
+
+            Hit h;
+            h.id = c->id;
+            h.rect = box.adjusted(-4, -4, 4, 4);
+            h.box = box;
+            h.text = QStringLiteral("%1\n%2 m  ·  %3 dBm")
+                         .arg(QString::fromStdString(c->label))
+                         .arg(range, 0, 'f', 2)
+                         .arg(c->levelDbm, 0, 'f', 1);
+            hit_.push_back(h);
         }
         p.setFont(font());
 
