@@ -756,19 +756,22 @@ void MainWindow::pollStartFinished() {
     }
 
     if (!startOk_) {
-        startBtn_->setEnabled(true);
-        stopBtn_->setEnabled(false);
         const QString e = QString::fromStdString(
             startErr_.empty() ? "unknown error" : startErr_);
+        // Put the interface back before showing anything modal. The dialog blocks,
+        // so setting the status afterwards left the window reading STARTING while
+        // a "Could not start" box was on screen, which is a contradiction.
+        startBtn_->setEnabled(true);
+        stopBtn_->setEnabled(false);
+        statusText_->setText("STOPPED");
+        statusDot_->setStyleSheet("color:#688C98; font-size:17px;");
+        pushEvent("START FAILED: " + e, "#FF5656");
         QMessageBox::warning(
             this, "Could not start",
             QString("No sensor started.\n\n%1\n\n"
                     "Radiometric capture needs root or CAP_NET_RAW:\n"
                     "    sudo setcap cap_net_raw,cap_net_admin+eip /usr/bin/rssiradar")
                 .arg(e));
-        statusText_->setText("STOPPED");
-        statusDot_->setStyleSheet("color:#688C98; font-size:17px;");
-        pushEvent("START FAILED: " + e, "#FF5656");
         return;
     }
 

@@ -495,9 +495,16 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
                        "    sudo systemctl restart NetworkManager\n"
                        "then reconnect to your network and start again.";
             else
-                *err = "could not determine a WiFi channel to listen on; " + iface_ +
-                       " is not associated with any network. Connect to a network "
-                       "and start again." +
+                // Do not tell the operator to connect to a network. Monitor mode
+                // does not need one: a monitor interface hears beaconing access
+                // points it has never joined, which is why the band sweep exists.
+                // That advice sent people off to fix something that was not
+                // broken, and it was wrong precisely in the case where the radio
+                // could not be moved to any frequency at all.
+                *err = "could not find a WiFi channel to listen on for " + iface_ +
+                       ". Nothing was transmitting on the 2.4 GHz band, or the radio "
+                       "could not be retuned; joining a network is not required and "
+                       "will not help." +
                        (sweepSummary.empty() ? "" : "\n" + sweepSummary);
         }
         reason_ = UnavailableReason::NotPresent;
@@ -1796,10 +1803,14 @@ int WifiRadiometricSensor::sweepBand(int confirmMs, std::string* detail) {
 
     std::vector<SweepProbe> survey;
     std::string tally;
+    int tuneFailures = 0;
     if (phy >= 0) {
         for (int i = 0; i < kCount; ++i) {
             SweepProbe pr;
-            if (!probe(kChannels[i], kSurveyMs, pr)) continue;
+            if (!probe(kChannels[i], kSurveyMs, pr)) {
+                ++tuneFailures;
+                continue;
+            }
             if (!tally.empty()) tally += " ";
             tally += std::to_string(pr.channel) + ":" + std::to_string(pr.frames);
             if (pr.usable > 0) tally += "/" + std::to_string(pr.usable) + "dBm" +
@@ -1841,7 +1852,23 @@ int WifiRadiometricSensor::sweepBand(int confirmMs, std::string* detail) {
         autoChannel_ = best;
     }
 
-    std::string msg = "band sweep: " + (tally.empty() ? "no channel could be tuned" : tally);
+    std::string msg = "band sweep: ";
+    if (tally.empty()) {
+        // Every retune failed, so the sweep never actually listened anywhere.
+        // Saying "no channel could be tuned" was true but unhelpful: it reads as
+        // though the band was empty when in fact the radio could not be moved to
+        // any frequency, which usually means monitor mode did not come up or the
+        // interface is still held by NetworkManager.
+        msg += "could not retune the radio on any channel";
+        if (phy < 0)
+            msg += " (no phy index for " + iface_ + ")";
+        else if (tuneFailures > 0)
+            msg += " (" + std::to_string(tuneFailures) + " of " + std::to_string(kCount) +
+                   " retunes rejected)";
+        msg += "; the band was never searched";
+    } else {
+        msg += tally;
+    }
     if (best > 0) {
         msg += " -> pinned channel " + std::to_string(best) + " (" +
                std::to_string(win.usable) + " radiometric frames, best " +
@@ -1849,7 +1876,7 @@ int WifiRadiometricSensor::sweepBand(int confirmMs, std::string* detail) {
         if (!rejected.empty()) msg += "; rejected " + rejected;
     } else if (!rejected.empty()) {
         msg += " -> no channel confirmed a link (" + rejected + ")";
-    } else {
+    } else if (!tally.empty()) {
         msg += " -> nothing transmitting on any channel; there is nothing to sense";
     }
     note(msg);
