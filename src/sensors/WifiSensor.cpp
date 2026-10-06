@@ -24,10 +24,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 namespace radar {
 
@@ -450,7 +452,7 @@ bool WifiRadiometricSensor::start(const Config& cfg, std::string* err) {
     // what makes the radio usable with nothing but its own antenna.
     std::string sweepSummary;
     if (needSweep) {
-        const int found = sweepBand(260, &sweepSummary);
+        const int found = sweepBand(900, &sweepSummary);
         if (found > 0) autoChannel_ = found;
     }
 
@@ -1533,9 +1535,49 @@ int WifiRadiometricSensor::forceReassociate() {
 // Returns the chosen channel, or 0 if the whole band was silent. A silent band is
 // a real, reportable result rather than a fault: with nothing transmitting there
 // is nothing to sense, and no processing could produce a detection from it.
-int WifiRadiometricSensor::sweepBand(int dwellMs, std::string* detail) {
+bool sweepProbeBetter(const SweepProbe& a, const SweepProbe& b) {
+    // A channel that produced no usable received power at all loses regardless of
+    // frame count: frames seen on a channel with nothing on it are noise, and
+    // counting them is how the sweep used to pin an empty channel.
+    if ((a.usable == 0) != (b.usable == 0)) return a.usable > b.usable;
+    if (a.bestRssiDbm != b.bestRssiDbm) return a.bestRssiDbm > b.bestRssiDbm;
+    return a.usable > b.usable;
+}
+
+int WifiRadiometricSensor::sweepBand(int confirmMs, std::string* detail) {
     static const int kChannels[] = {1, 6, 11, 2, 7, 12, 3, 8, 13, 4, 9, 10, 5};
     constexpr int kCount = static_cast<int>(sizeof(kChannels) / sizeof(kChannels[0]));
+
+    // --- how this used to decide, and why it picked the wrong channel.
+    //
+    // It counted every frame the radio delivered, on every channel, with a 260 ms
+    // dwell, and took whichever channel returned the most. An access point
+    // beaconing at the usual 10 Hz puts about two beacons into a 260 ms window,
+    // so a real access point scored two or three -- the same as the noise floor
+    // throws onto an empty channel. Ties were broken by position in the sweep
+    // order, so the winner was whichever tied channel happened to be visited
+    // first. With one access point in range on channel 9 and two frames seen on
+    // channel 8 as well, it pinned 8 and then reported a 0.0 Hz sample rate for
+    // the rest of the session, with the access point drawn as a stale contact
+    // that never went away.
+    //
+    // Frame count at that dwell is not evidence of anything. Received power is.
+    // A nearby access point reads around -30 dBm and an empty channel sits near
+    // -85, so a single strong radiometric reading settles the question that two
+    // or three frames cannot.
+
+    // Long enough that an access point puts several beacons on the channel,
+    // short enough to survey the band without a visible stall at startup.
+    constexpr int kSurveyMs = 130;
+    // The synthesiser needs a moment after retune; counting before it settles
+    // credits the previous channel's traffic to this one.
+    constexpr int kSettleMs = 45;
+    // A channel is only worth listening on if the radio reports usable received
+    // power on it, repeatedly.
+    constexpr int kMinUsable = 3;
+    // How many of the survey's best candidates to confirm properly.
+    constexpr size_t kConfirmCount = 3;
+
     const int phy = phyIndexOf(iface_);
 
     // A private socket for the sweep. The main capture socket is opened later,
@@ -1555,38 +1597,72 @@ int WifiRadiometricSensor::sweepBand(int dwellMs, std::string* detail) {
         return 0;
     }
 
-    std::string tally;
-    int best = 0;
-    uint64_t bestFrames = 0;
+    // Retune to a channel and measure it. Parsing goes through the same
+    // parseRadiotap the capture path uses, so a driver whose radiotap layout the
+    // parser has to work around is handled identically here -- otherwise the
+    // sweep could reject a channel on which capture would have worked.
+    const auto probe = [&](int ch, int ms, SweepProbe& out) -> bool {
+        out.channel = ch;
+        out.frames = out.usable = 0;
+        out.bestRssiDbm = -999.0;
+        if (nl80211SetChannel(phy, ch) != 0) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(kSettleMs));
 
-    if (phy >= 0) {
-        for (int i = 0; i < kCount; ++i) {
-            const int ch = kChannels[i];
-            currentChannel_.store(ch, std::memory_order_relaxed);
-            if (nl80211SetChannel(phy, ch) != 0) continue;
-
-            // Settle on the synthesiser, then count. Counting from the first
-            // millisecond would credit the previous channel's dwell to this one.
-            std::this_thread::sleep_for(std::chrono::milliseconds(dwellMs / 3));
-            uint64_t n = 0;
-            const auto until = Clock::now() + std::chrono::milliseconds(dwellMs);
-            while (Clock::now() < until) {
-                uint8_t buf[2048];
-                const auto untilPoll = std::min(Clock::now() + std::chrono::milliseconds(15), until);
-                while (Clock::now() < untilPoll) {
-                    const ssize_t r = ::recv(sfd, buf, sizeof(buf), MSG_DONTWAIT);
-                    if (r > 0) ++n;
-                    else std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        Observation obs;
+        const auto until = Clock::now() + std::chrono::milliseconds(ms);
+        while (Clock::now() < until) {
+            uint8_t buf[2048];
+            const ssize_t r = ::recv(sfd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (r > 0) {
+                ++out.frames;
+                bool isData = false;
+                if (parseRadiotap(buf, static_cast<size_t>(r), obs, isData) &&
+                    obs.rssiDbm >= -110.0 && obs.rssiDbm <= -20.0) {
+                    ++out.usable;
+                    if (obs.rssiDbm > out.bestRssiDbm) out.bestRssiDbm = obs.rssiDbm;
                 }
-            }
-
-            if (!tally.empty()) tally += " ";
-            tally += std::to_string(ch) + ":" + std::to_string(n);
-            if (n > bestFrames) {
-                bestFrames = n;
-                best = ch;
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
         }
+        return true;
+    };
+
+    std::vector<SweepProbe> survey;
+    std::string tally;
+    if (phy >= 0) {
+        for (int i = 0; i < kCount; ++i) {
+            SweepProbe pr;
+            if (!probe(kChannels[i], kSurveyMs, pr)) continue;
+            if (!tally.empty()) tally += " ";
+            tally += std::to_string(pr.channel) + ":" + std::to_string(pr.frames);
+            if (pr.usable > 0) tally += "/" + std::to_string(pr.usable) + "dBm" +
+                                       std::to_string(static_cast<int>(pr.bestRssiDbm));
+            survey.push_back(pr);
+        }
+        std::sort(survey.begin(), survey.end(),
+                  [](const SweepProbe& a, const SweepProbe& b) { return sweepProbeBetter(a, b); });
+    }
+
+    // Confirm the strongest candidates with a long enough dwell to be sure.
+    // The survey is deliberately too short to commit on; this is the pass that
+    // decides, and it is allowed to reject everything the survey proposed.
+    int best = 0;
+    SweepProbe win;
+    std::string rejected;
+    for (size_t i = 0; i < survey.size() && i < kConfirmCount; ++i) {
+        if (survey[i].usable == 0) break;  // nothing further down has a reading
+        SweepProbe pr;
+        if (!probe(survey[i].channel, confirmMs, pr)) continue;
+        if (pr.usable < kMinUsable) {
+            if (!rejected.empty()) rejected += ", ";
+            rejected += "channel " + std::to_string(pr.channel) + " (" +
+                        std::to_string(pr.usable) + " radiometric frames)";
+            continue;
+        }
+        best = pr.channel;
+        win = pr;
+        break;
     }
 
     ::close(sfd);
@@ -1599,12 +1675,17 @@ int WifiRadiometricSensor::sweepBand(int dwellMs, std::string* detail) {
         autoChannel_ = best;
     }
 
-    std::string msg = "band sweep: " + tally;
-    if (best > 0)
+    std::string msg = "band sweep: " + (tally.empty() ? "no channel could be tuned" : tally);
+    if (best > 0) {
         msg += " -> pinned channel " + std::to_string(best) + " (" +
-               std::to_string(bestFrames) + " frames on it)";
-    else
+               std::to_string(win.usable) + " radiometric frames, best " +
+               std::to_string(static_cast<int>(win.bestRssiDbm)) + " dBm)";
+        if (!rejected.empty()) msg += "; rejected " + rejected;
+    } else if (!rejected.empty()) {
+        msg += " -> no channel confirmed a link (" + rejected + ")";
+    } else {
         msg += " -> nothing transmitting on any channel; there is nothing to sense";
+    }
     note(msg);
     if (detail) *detail = msg;
     return best;

@@ -236,11 +236,16 @@ class WifiRadiometricSensor : public ISensor {
     // Re-pin the synthesiser to the target channel, which is what silently
     // breaks when the access point roams to another channel.
     bool repinChannel();
-    // Sweep the 2.4 GHz band counting frames on each channel, and pin the most
-    // productive one. This is what removes the need for an association: monitor
-    // mode does not need to be joined to anything, it only needs a frequency,
-    // and a sweep finds a frequency with traffic on it.
-    int sweepBand(int dwellMs, std::string* detail);
+    // Survey the 2.4 GHz band, then confirm the strongest candidates on a longer
+    // dwell, and pin the channel that actually carries a link. This is what
+    // removes the need for an association: monitor mode does not need to be
+    // joined to anything, it only needs a frequency, and a sweep finds a
+    // frequency worth listening on.
+    //
+    // Channels are ranked by strongest received power, not by frame count: at
+    // survey dwells a beaconing access point and an empty channel both return a
+    // couple of frames, so counting cannot tell them apart.
+    int sweepBand(int confirmMs, std::string* detail);
 
     int fd_ = -1;
     std::thread thread_;
@@ -372,6 +377,24 @@ struct HardwareSurvey {
     bool btDirectionFinding = false;
     std::vector<std::string> notes;
 };
+
+// What the band sweep measured on one channel, and the rule it ranks channels
+// by. Exposed so the decision can be tested without a radio: getting this wrong
+// is what made the sweep pin empty channels.
+struct SweepProbe {
+    int channel = 0;
+    uint64_t frames = 0;       // every frame the radio delivered
+    int usable = 0;            // frames carrying a usable radiotap received power
+    double bestRssiDbm = -999.0;  // strongest single reading on this channel
+};
+
+// True when a is the better channel to listen on.
+//
+// A channel with no usable reading at all always loses, however many frames it
+// happened to see: frames on an empty channel are noise. Otherwise the strongest
+// received power wins, because that is the link with the best signal to noise for
+// radiometric work, and the count of usable readings only breaks ties.
+bool sweepProbeBetter(const SweepProbe& a, const SweepProbe& b);
 
 HardwareSurvey surveyHardware();
 std::string helperRun(const std::string& exe, const std::string& args);
