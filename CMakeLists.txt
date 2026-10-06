@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(rssiradar VERSION 1.4.0 LANGUAGES CXX
+project(rssiradar VERSION 1.4.1 LANGUAGES CXX
         DESCRIPTION "Passive WiFi/Bluetooth radiometric motion sensing")
 
 set(CMAKE_CXX_STANDARD 17)

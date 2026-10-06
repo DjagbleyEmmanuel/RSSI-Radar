@@ -126,6 +126,13 @@ class ContactTracker {
     // Per-contact velocity filter state.
     std::map<uint64_t, double> velState_;
     std::map<uint64_t, double> lastLevel_;
+
+    // RssiTrack::count() is cumulative and never shrinks, so a track that has
+    // gone quiet still reports the sample count it died on. Remembering the
+    // count each track was last folded in at is what lets the tracker tell a
+    // transmitter that is still being heard from one that merely has samples in
+    // its history. Without this the decay and expiry below cannot ever run.
+    std::map<uint64_t, size_t> sampleMark_;
 };
 
 }  // namespace radar

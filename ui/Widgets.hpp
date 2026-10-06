@@ -89,13 +89,42 @@ class RadarScope : public QWidget {
 
     // Test hook: number of pairs of drawn contact labels that overlap. Zero is
     // the requirement; eyeballing a screenshot is not a sufficient check.
+    //
+    // The AP badge counts too: it is fixed text at the top-left of the sweep and
+    // is seeded into the label declutter as occupied space, so a label landing on
+    // it would be exactly the overlap this is here to prevent. Those collisions
+    // are returned as extra counts, which is why the total is not necessarily
+    // even.
     int labelOverlaps() const {
         int n = 0;
         // Compared on the drawn geometry, not the padded hover rectangle.
-        for (size_t i = 0; i < hit_.size(); ++i)
+        for (size_t i = 0; i < hit_.size(); ++i) {
             for (size_t j = i + 1; j < hit_.size(); ++j)
                 if (hit_[i].box.intersects(hit_[j].box)) ++n;
+            if (!badgeRect_.isEmpty() && badgeRect_.intersects(hit_[i].box)) ++n;
+        }
         return n;
+    }
+
+    // Test hook: the AP badge rectangle exactly as drawn.
+    QRectF apBadgeRect() const { return badgeRect_; }
+
+    // Test hook: the hover readout rectangle exactly as drawn. Empty when
+    // nothing is hovered, which is what makes "hovering shows something" a
+    // checkable claim rather than an assumption.
+    QRectF hoverRect() const { return hoverStrip_; }
+
+    // Test hooks: the two fields of the readout, so a test can measure what they
+    // actually need rather than guessing at a hardcoded string.
+    QString hoverHeadText() const { return hoverHead_; }
+    QString hoverDetailText() const { return hoverDetail_; }
+
+    // Test hook: the drawn label rectangle for one contact, so a test can aim a
+    // synthetic mouse move at it and exercise the hover path.
+    QRectF labelRect(uint64_t id) const {
+        for (const auto& h : hit_)
+            if (h.id == id) return h.box;
+        return QRectF();
     }
 
   protected:
@@ -109,10 +138,16 @@ class RadarScope : public QWidget {
         uint64_t id = 0;
         QRectF rect;   // padded, for hover tolerance
         QRectF box;    // the label rectangle exactly as drawn
-        QString text;
     };
     std::vector<Hit> hit_;
-    QString lastTip_;
+    uint64_t hoverId_ = 0;
+    // Fixed text at the top-left of the sweep. Kept as a member rather than a
+    // local so the declutter pass below it and the layout test can both see it.
+    QRectF badgeRect_;
+    // The hover readout along the bottom edge, same reasoning.
+    QRectF hoverStrip_;
+    QString hoverHead_;
+    QString hoverDetail_;
     // Channel currently being listened to, shown in the hover readout.
 
     struct Blip {

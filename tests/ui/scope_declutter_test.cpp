@@ -3,7 +3,9 @@
 // Renders the PPI with many deliberately colliding contacts -- all at nearly the
 // same range and bearing, which is the worst case the scope will meet in a room
 // with several access points -- and asserts that no two drawn contact labels
-// overlap.
+// overlap, and that none of them lands on the fixed AP badge at the top-left.
+// The badge is the other piece of text on the sweep, so a label printed over it
+// would be an overlap too.
 //
 // Layout only. This builds a Snapshot by hand, feeds nothing into the engine,
 // and produces no reported data; it exists purely to check the scope does not
@@ -18,7 +20,8 @@
 //       $(pkg-config --libs Qt6Widgets Qt6Gui Qt6Core)
 //   QT_QPA_PLATFORM=offscreen /tmp/scope_test
 //
-// Exits non-zero if any label pair overlaps.
+// Exits non-zero if any label pair overlaps, or if any label lands on the AP
+// badge.
 #include <QApplication>
 #include <QImage>
 #include <QPainter>
@@ -46,8 +49,16 @@ int main(int argc, char** argv){
   img.save("/tmp/opencode/declutter.png");
   // Count overlapping label boxes. Filled in by the widget during paint, so the
   // check is made against what was actually drawn rather than what was intended.
+  // labelOverlaps() also counts any label colliding with the AP badge.
   const int overlaps = w.labelOverlaps();
-  std::printf("rendered %d contacts, %d overlapping label pairs\n",
+  const QRectF badge = w.apBadgeRect();
+  std::printf("rendered %d contacts, %d overlapping text pairs\n",
               (int)s.contacts.size(), overlaps);
+  std::printf("ap badge at (%.0f,%.0f) %.0fx%.0f, non-empty=%d\n",
+              badge.x(), badge.y(), badge.width(), badge.height(), !badge.isEmpty());
+  if (badge.isEmpty()) {
+    std::printf("FAIL: the AP badge was not drawn at all\n");
+    return 1;
+  }
   return overlaps == 0 ? 0 : 1;
 }

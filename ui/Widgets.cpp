@@ -4,7 +4,6 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
-#include <QToolTip>
 #include <QMouseEvent>
 #include <QPainterPath>
 #include <QTimerEvent>
@@ -57,37 +56,32 @@ RadarScope::RadarScope(QWidget* parent) : QWidget(parent) {
     setMinimumSize(360, 360);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     setMouseTracking(true);
-    setToolTip("Hover a contact for its identity");
 }
 
+// Hovering used to pop a QToolTip over the sweep carrying the contact's label,
+// range and level. It sat directly on top of the APs the operator was trying to
+// read, and because it followed the cursor it also covered whatever the cursor
+// moved to next. The full identity of every contact is already in the Tracking
+// tab's table, so the tooltip was pure duplication that got in the way. It is
+// gone; hovering now only marks the label under the pointer with a brighter
+// outline, which identifies the blip without covering any other text.
 void RadarScope::mouseMoveEvent(QMouseEvent* e) {
     const QPointF pos = e->position();
-    const Hit* found = nullptr;
+    uint64_t under = 0;
     for (const auto& h : hit_)
         if (h.rect.contains(pos)) {
-            found = &h;
+            under = h.id;
             break;
         }
-    if (found) {
-        if (found->text != lastTip_) {
-            lastTip_ = found->text;
-            QToolTip::showText(e->globalPosition().toPoint(), lastTip_, this);
-        }
-        setCursor(Qt::PointingHandCursor);
-    } else {
-        if (!lastTip_.isEmpty()) {
-            lastTip_.clear();
-            QToolTip::hideText();
-        }
-        setCursor(Qt::ArrowCursor);
-    }
+    hoverId_ = under;
+    setCursor(under ? Qt::PointingHandCursor : Qt::ArrowCursor);
+    update();
     QWidget::mouseMoveEvent(e);
 }
 
 void RadarScope::leaveEvent(QEvent* e) {
-    lastTip_.clear();
+    hoverId_ = 0;
     hit_.clear();
-    QToolTip::hideText();
     QWidget::leaveEvent(e);
 }
 
@@ -239,6 +233,160 @@ void RadarScope::paintEvent(QPaintEvent*) {
         }
     }
 
+    // --- AP count / bearing badge.
+    //
+    // Lives at the top-left of the sweep, outside the ring, and is always drawn.
+    //
+    // It used to be conditional on there being motion marks to explain, and it
+    // counted snap_.directionTransmitters -- the number of transmitters the
+    // direction estimator had locked onto, which is a different thing entirely.
+    // That is how a sweep showing fourteen AP blips could carry a badge reading
+    // "1 AP": the badge was reporting one *bearing* solution, not one access
+    // point, and clamping it with max(1, ...) made it claim an AP even at zero.
+    // The count is now the number of contacts actually being tracked, which is
+    // what the blips on the scope are drawn from, so the badge and the sweep
+    // cannot disagree. Bearing stays a separate, honest field: it says N/A unless
+    // anchors actually resolved a direction.
+    //
+    // The rectangle is published as apBadgeRect so the contact labels below can
+    // treat it as occupied space and declutter around it.
+    badgeRect_ = QRectF();
+    QRectF& apBadgeRect = badgeRect_;
+    {
+        // The badge counts exactly what the sweep draws, using the identical
+        // presence test, so the number can never disagree with the number of
+        // blips on screen. That agreement is the whole point: the old badge read
+        // "1 AP" over fourteen blips.
+        int apCount = 0;
+        for (const auto& c : snap_.contacts)
+            if (c.presence > 0.01) ++apCount;
+
+        const QString badge =
+            QStringLiteral("%1 AP%2  ·  BEARING %3")
+                .arg(apCount)
+                .arg(apCount == 1 ? QString() : QStringLiteral("s"))
+                .arg(snap_.fusion.ok ? QStringLiteral("%1°").arg(snap_.fusion.bearingDeg, 0, 'f', 0)
+                                     : QStringLiteral("N/A"));
+
+        p.setFont(QFont(font().family(), 8, QFont::Bold));
+        const QFontMetrics fm(p.font());
+        const int th = 18;
+        const int tw = fm.horizontalAdvance(badge) + 30;
+        apBadgeRect = QRectF(10, 10, tw, th);
+
+        const bool haveBearing = snap_.fusion.ok;
+        const QColor accent = haveBearing ? theme::green() : QColor(255, 186, 66);
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 120), 1));
+        p.setBrush(QColor(14, 11, 6, 215));
+        p.drawRoundedRect(apBadgeRect, 9, 9);
+
+        // Miniature compass: a needle when a bearing was genuinely measured,
+        // and the same needleless crossed circle when it was not, so "no
+        // direction" is readable at a glance rather than needing the text.
+        const QPointF cc(apBadgeRect.left() + 13, apBadgeRect.center().y());
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 150), 1, Qt::DotLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawEllipse(cc, 5, 5);
+        p.setPen(QPen(QColor(accent.red(), accent.green(), accent.blue(), 190), 1.2));
+        if (haveBearing) {
+            const double a = snap_.fusion.bearingDeg * kPi / 180.0 - kPi / 2.0;
+            p.drawLine(cc - QPointF(3.5 * std::cos(a), 3.5 * std::sin(a)),
+                       cc + QPointF(3.5 * std::cos(a), 3.5 * std::sin(a)));
+        } else {
+            p.drawLine(cc + QPoint(-3, 3), cc + QPoint(3, -3));
+        }
+
+        p.setPen(QColor(226, 242, 248, 230));
+        p.drawText(QRect(apBadgeRect.left() + 23, apBadgeRect.top(),
+                         apBadgeRect.width() - 26, th),
+                   Qt::AlignLeft | Qt::AlignVCenter, badge);
+        p.setFont(font());
+    }
+
+    // --- hovered contact readout.
+    //
+    // Hovering a blip reports that contact's identity in a fixed strip along the
+    // bottom edge of the sweep.
+    //
+    // This was originally a QToolTip following the cursor. That was genuinely
+    // unusable: it covered the access points being read, and it moved with the
+    // pointer so it also hid whatever the pointer moved to next. Removing the
+    // tooltip fixed the obstruction but took the identity with it, and the sweep
+    // cannot show it on its own -- every blip is labelled "AP", so there was no
+    // way to tell which tracked transmitter was which without leaving for the
+    // Tracking tab.
+    //
+    // A docked strip avoids both problems. It is in a fixed place, so it never
+    // covers the sweep the pointer is on, and it is measured and reserved before
+    // the contact labels are placed (see below), so it cannot overlap a label or
+    // a blip either. It appears only while hovering and is empty otherwise.
+    hoverStrip_ = QRectF();
+    hoverHead_.clear();
+    hoverDetail_.clear();
+    QRectF& hoverStrip = hoverStrip_;
+    QString& hoverHead = hoverHead_;
+    QString& hoverDetail = hoverDetail_;
+
+    // Both fields are measured against the fonts they are actually drawn with.
+    // Measuring against the widget's own font instead made the computed width
+    // disagree with the rendered text, which is how the identity ended up
+    // elided even when the strip was wide enough to hold it in full.
+    const QFont hoverHeadFont(font().family(), 8, QFont::Bold);
+    const QFont hoverDetailFont(font().family(), 8);
+    const int hoverPad = 9;
+    if (hoverId_ != 0) {
+        const Contact* hc = nullptr;
+        for (const auto& c : snap_.contacts)
+            if (c.id == hoverId_) {
+                hc = &c;
+                break;
+            }
+        if (hc) {
+            const double r = hc->rangeValid ? hc->rangeM : rangeFromDbm(hc->levelDbm);
+            hoverHead = QString::fromStdString(hc->label);
+
+            // Deliberately short. The first version spelled out everything the
+            // widget knew -- range with its shadowing interval, level, state,
+            // velocity and bearing -- which ran to well over half the sweep's
+            // width and read as a banner laid across the scope rather than a
+            // readout tucked into a corner.
+            //
+            // So this carries only what identifies the blip and how strong it is:
+            // range, level, the state only when it is not plainly ACTIVE, and a
+            // bearing only when one was actually measured. The badge at the top
+            // already reports bearing globally, and the Tracking tab carries the
+            // full row per contact including the range interval and velocity, so
+            // dropping them here costs nothing.
+            hoverDetail = hc->rangeValid ? QStringLiteral("%1 m").arg(r, 0, 'f', 2)
+                                         : QStringLiteral("range n/a");
+            hoverDetail += QStringLiteral("  ·  %1 dBm").arg(hc->levelDbm, 0, 'f', 1);
+            if (hc->state != ContactState::Active)
+                hoverDetail += QStringLiteral("  ·  %1").arg(toString(hc->state));
+            // Never claim a direction that was not measured.
+            if (hc->bearingValid)
+                hoverDetail += QStringLiteral("  ·  %1°").arg(hc->bearingDeg, 0, 'f', 0);
+
+            const QFontMetrics hf(hoverHeadFont);
+            const QFontMetrics df(hoverDetailFont);
+            // Width holds the identity and the measurements side by side, but it
+            // is capped well below the sweep's width and the identity itself is
+            // capped at a share of that. A readout that can span the scope stops
+            // being a corner note and becomes the thing you are looking at
+            // instead of the sweep. Long SSIDs elide; the Tracking tab has them
+            // in full.
+            const int maxStripW = static_cast<int>(width() * 0.46);
+            const int hw = hf.horizontalAdvance(hoverHead);
+            const int dw = df.horizontalAdvance(hoverDetail);
+            const int w = std::clamp(hw + dw + 3 * hoverPad, 140, maxStripW);
+            // Sits directly above the waterfall decay strip, which owns the
+            // bottom edge of the scope. Both stay visible instead of one
+            // painting over the other.
+            const int wfH = history_.empty() ? 0 : std::min(28, height() / 8);
+            hoverStrip = QRectF(8, height() - wfH - hf.height() - 8,
+                                std::max(140, w), hf.height() + 4);
+        }
+    }
+
     // --- motion marks.
     //
     // A contact is a transmitter: one exists per access point in range and it
@@ -255,7 +403,6 @@ void RadarScope::paintEvent(QPaintEvent*) {
         const double nowWall =
             std::chrono::duration<double>(snap_.stamp.time_since_epoch()).count();
         const double life = 14.0;
-        const bool anyBearing = snap_.fusion.ok;
 
         for (const auto& m : snap_.motionMarks) {
             const double age = nowWall - m.wallTime;
@@ -307,40 +454,6 @@ void RadarScope::paintEvent(QPaintEvent*) {
                                .arg(age, 0, 'f', 0));
                 p.setFont(font());
             }
-        }
-
-        // A compact badge at the left edge rather than a sentence across the
-        // middle of the scope. The earlier caption spanned the full width of the
-        // sweep and sat right where the marks are, which is the worst possible
-        // place for a piece of text that exists to explain them.
-        if (!snap_.motionMarks.empty() && !anyBearing) {
-            const int apCount = std::max(1, static_cast<int>(snap_.directionTransmitters));
-            const QString badge = apCount > 1 ? QStringLiteral("BEARING N/A")
-                                             : QStringLiteral("1 AP · BEARING N/A");
-
-            p.setFont(QFont(font().family(), 8, QFont::Bold));
-            const QFontMetrics fm(p.font());
-            const int tw = fm.horizontalAdvance(badge) + 30;
-            const int th = 18;
-            const QRect box(10, 10, tw, th);
-
-            p.setPen(QPen(QColor(255, 186, 66, 120), 1));
-            p.setBrush(QColor(14, 11, 6, 215));
-            p.drawRoundedRect(box, 9, 9);
-
-            // Miniature compass with no needle: reads as "no direction" at a
-            // glance without needing to be read at all.
-            const QPoint cc(box.left() + 13, box.center().y());
-            p.setPen(QPen(QColor(255, 186, 66, 150), 1, Qt::DotLine));
-            p.setBrush(Qt::NoBrush);
-            p.drawEllipse(cc, 5, 5);
-            p.setPen(QPen(QColor(255, 186, 66, 190), 1.2));
-            p.drawLine(cc + QPoint(-3, 3), cc + QPoint(3, -3));
-
-            p.setPen(QColor(255, 206, 140, 225));
-            p.drawText(QRect(box.left() + 23, box.top(), tw - 26, th),
-                       Qt::AlignLeft | Qt::AlignVCenter, badge);
-            p.setFont(font());
         }
     }
 
@@ -481,6 +594,14 @@ void RadarScope::paintEvent(QPaintEvent*) {
         p.setFont(QFont(font().family(), 8));
         const QFontMetrics fm(p.font());
         std::vector<QRectF> taken;
+        // The AP badge is drawn first and is fixed at the top-left, so it is
+        // seeded into the occupied list. Without this a label could be placed on
+        // top of the badge whenever a contact happened to sit in that corner,
+        // which is exactly the "no overlapping text" rule the scope is held to.
+        if (!apBadgeRect.isEmpty()) taken.push_back(apBadgeRect);
+        // Same for the hover readout: reserved before placement so a label can
+        // never be printed underneath it.
+        if (!hoverStrip.isEmpty()) taken.push_back(hoverStrip);
         for (const auto& pl : placed)
             taken.push_back(QRectF(pl.shownPos.x() - 7, pl.shownPos.y() - 7, 14, 14));
 
@@ -501,11 +622,22 @@ void RadarScope::paintEvent(QPaintEvent*) {
             const QColor base = theme::forMac(macHash(c->mac));
             const int alpha = static_cast<int>(255 * std::clamp(c->presence, 0.0, 1.0));
 
+            // The label names the contact and nothing else.
+            //
+            // It used to append the contact's state, so a contact part way
+            // through its hold window read "AP FADING" -- which reads as though
+            // FADING were part of the access point's name. The state is also
+            // high-churn: a strong AP sitting near the origin is heard
+            // continuously but can miss the odd frame, and every such miss used
+            // to change the state and therefore the label's width, so the label
+            // and its leader line jittered continuously.
+            //
+            // Fading is already legible without a word: the ageing halo widens,
+            // and the label's own alpha falls with presence. The Tracking tab
+            // lists state per contact for anyone who wants it spelled out.
             QString tag = QStringLiteral("AP");
             if (pl.displaced || ringRange <= range)
                 tag += QStringLiteral(" %1m").arg(range, 0, 'f', 1);
-            if (c->state != ContactState::Active)
-                tag += QStringLiteral(" %1").arg(toString(c->state));
             if (!c->bearingValid) tag += QStringLiteral("·");
 
             const qreal tw = fm.horizontalAdvance(tag) + 8;
@@ -556,8 +688,14 @@ void RadarScope::paintEvent(QPaintEvent*) {
                           1));
             p.drawLine(anchor, box.center());
 
+            // Hover only brightens the outline of the label under the pointer.
+            // This replaces the tooltip: it says which blip you are pointing at
+            // without drawing anything over the rest of the sweep.
+            const bool hovered = hoverId_ != 0 && c->id == hoverId_;
             p.setPen(QColor(base.red(), base.green(), base.blue(), alpha));
-            p.fillRect(box, QColor(6, 12, 16, 215));
+            p.fillRect(box, QColor(6, 12, 16, hovered ? 235 : 215));
+            p.setPen(hovered ? QColor(255, 255, 255, std::min(255, alpha))
+                             : QColor(base.red(), base.green(), base.blue(), alpha));
             p.drawRect(box);
             p.setPen(QColor(226, 242, 248, alpha));
             p.drawText(box, Qt::AlignCenter, tag);
@@ -566,10 +704,6 @@ void RadarScope::paintEvent(QPaintEvent*) {
             h.id = c->id;
             h.rect = box.adjusted(-4, -4, 4, 4);
             h.box = box;
-            h.text = QStringLiteral("%1\n%2 m  ·  %3 dBm")
-                         .arg(QString::fromStdString(c->label))
-                         .arg(range, 0, 'f', 2)
-                         .arg(c->levelDbm, 0, 'f', 1);
             hit_.push_back(h);
         }
         p.setFont(font());
@@ -615,6 +749,53 @@ void RadarScope::paintEvent(QPaintEvent*) {
             p.fillRect(QRect(strip.left() + i, strip.top() + 1, 1, barH), QBrush(c >= 0.01 ? theme::cyan() : theme::cyanDim()));
             (void)col;
         }
+    }
+
+    // --- hover readout, drawn last of all.
+    //
+    // It has to come after the waterfall decay strip: that strip owns the bottom
+    // 28 px of the scope, and when the readout was drawn earlier it was painted
+    // over by it and never appeared at all.
+    if (!hoverStrip.isEmpty()) {
+        const Contact* hc = nullptr;
+        for (const auto& c : snap_.contacts)
+            if (c.id == hoverId_) {
+                hc = &c;
+                break;
+            }
+        const QColor base = theme::forMac(hc ? macHash(hc->mac) : 0);
+        p.setPen(QPen(QColor(base.red(), base.green(), base.blue(), 190), 1));
+        p.setBrush(QColor(6, 12, 16, 240));
+        p.drawRoundedRect(hoverStrip, 4, 4);
+
+        // Identity on the left in that contact's colour, measurements on the
+        // right and dimmer. Two aligned fields in one row keeps the strip short
+        // and leaves the sweep above it completely clear.
+        const QFontMetrics bf(hoverHeadFont);
+        const QFontMetrics df(hoverDetailFont);
+        // Each field gets only what it needs, and the identity never takes more
+        // than half the strip: an SSID is short and the measurements are long,
+        // so splitting it down the middle starved the numbers.
+        const int avail = std::max<int>(40, hoverStrip.width() - 2 * hoverPad);
+        const int headW = std::clamp(bf.horizontalAdvance(hoverHead), 40, avail / 2);
+        const int detailW = std::max(40, avail - headW);
+        const QString head = bf.elidedText(hoverHead, Qt::ElideRight, headW);
+        const QString detail = df.elidedText(hoverDetail, Qt::ElideRight, detailW);
+
+        // Tinted towards the contact's own colour so the readout can be matched
+        // to its blip at a glance.
+        p.setFont(hoverHeadFont);
+        p.setPen(base.lighter(170));
+        p.drawText(
+            QRect(hoverStrip.left() + hoverPad, hoverStrip.top(), headW, hoverStrip.height()),
+            Qt::AlignLeft | Qt::AlignVCenter, head);
+
+        p.setFont(hoverDetailFont);
+        p.setPen(QColor(158, 190, 204, 230));
+        p.drawText(QRect(hoverStrip.left() + hoverPad, hoverStrip.top(), avail,
+                         hoverStrip.height()),
+                   Qt::AlignRight | Qt::AlignVCenter, detail);
+        p.setFont(font());
     }
 }
 

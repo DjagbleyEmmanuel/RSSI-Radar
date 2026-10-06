@@ -7,10 +7,6 @@ Comment=Passive WiFi/Bluetooth radiometric motion detection with real raw-socket
 Exec=rssiradar
 Icon=rssiradar
 Terminal=false
-# No password prompt: the installed binary carries cap_net_raw and
-# cap_net_admin as file capabilities, and the device is released from
-# NetworkManager with `nmcli device set managed no`, which polkit permits for
-# the active local user without authentication.
 Categories=Science;Network;Monitor;Utility;
 Keywords=wifi;bluetooth;rssi;rssi;radar;motion;presence;monitor;csi;
 StartupNotify=true

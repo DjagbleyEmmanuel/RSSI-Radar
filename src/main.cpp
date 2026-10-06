@@ -325,7 +325,7 @@ int main(int argc, char** argv) {
 
     QApplication app(argc, argv);
     QCoreApplication::setApplicationName("rssiradar");
-    QCoreApplication::setApplicationVersion("1.4.0");
+    QCoreApplication::setApplicationVersion("1.4.1");
 
     QCommandLineParser parser;
     parser.setApplicationDescription(

@@ -20,6 +20,7 @@ void ContactTracker::reset() {
     vanished_.clear();
     velState_.clear();
     lastLevel_.clear();
+    sampleMark_.clear();
     nextId_ = 1;
 }
 
@@ -55,6 +56,27 @@ void ContactTracker::update(const std::vector<RssiTrack>& tracks, double now, do
     for (const auto& t : tracks) {
         const uint64_t key = macHash(t.mac);
         if (t.count() == 0) continue;
+
+        // Is this transmitter actually being heard *now*, or is this just the
+        // history it accumulated before it went quiet?
+        //
+        // RssiTrack::count() is samplesDbm.size(): cumulative, and never reduced
+        // or pruned anywhere. Every track ever seen therefore reports a non-zero
+        // count forever, so the `count() > 0` test below used to pass on every
+        // tick for every contact. That reset framesMissed to 0 unconditionally,
+        // which meant the silence counter could never advance, which meant the
+        // decay and expiry code further down was unreachable: contacts never
+        // faded and never expired, and each one sat on the scope forever holding
+        // the range it had when it was last alive. A quiet band filled up with
+        // stale blips rather than emptying.
+        //
+        // Comparing against the count seen last time is what actually answers
+        // "did a new frame arrive", and it is the only way the hold window can
+        // do its job.
+        const auto prevMark = sampleMark_.find(key);
+        const bool heardNow = (prevMark == sampleMark_.end()) || (t.count() > prevMark->second);
+        sampleMark_[key] = t.count();
+        if (!heardNow) continue;  // fall through to the decay logic below
 
         // Reject a transmitter that has only been seen once or twice: a single
         // frame produces a range with no error bar at all.
@@ -162,9 +184,31 @@ void ContactTracker::update(const std::vector<RssiTrack>& tracks, double now, do
             drop.push_back(kv.first);
             continue;
         }
+
+        // A tick that happens to land between two frames is not silence.
+        //
+        // At ~20 Hz frames and a comparable engine tick rate, most ticks see no
+        // new sample at all, so every one of them used to count as the start of
+        // a disappearance. That drove presence just under 1.0 and flipped the
+        // state on almost every pass, which made a perfectly healthy strong AP
+        // alternate ACTIVE/FADING many times a second. Because the state was
+        // spelled out in the blip label, the label changed width on each flip
+        // and the single blip sitting at the origin read as a rapid flicker --
+        // it looked like it was bleeping rather than being continuously heard.
+        //
+        // So decay only begins once the gap between frames is a real fraction of
+        // the hold window. Below that the contact is simply still there.
+        const double grace = std::clamp(hold * 0.2, 0.15, 1.0);
+        if (c.silenceSeconds < grace) {
+            c.presence = 1.0;
+            c.state = ContactState::Active;
+            continue;
+        }
+
         // Linear decay over the hold window, so the fade is predictable rather
         // than an abrupt disappearance.
-        c.presence = std::clamp(1.0 - c.silenceSeconds / hold, 0.0, 1.0);
+        const double t = (c.silenceSeconds - grace) / std::max(1e-6, hold - grace);
+        c.presence = std::clamp(1.0 - t, 0.0, 1.0);
         c.state = c.presence > 0.35 ? ContactState::Fading : ContactState::Lost;
     }
 
@@ -173,6 +217,8 @@ void ContactTracker::update(const std::vector<RssiTrack>& tracks, double now, do
         live_.erase(key);
         velState_.erase(key);
         lastLevel_.erase(key);
+        // sampleMark_ survives the drop on purpose -- see the note in the
+        // population-bound loop below.
     }
 
     // --- recency ordering, most recently heard first.
@@ -194,6 +240,14 @@ void ContactTracker::update(const std::vector<RssiTrack>& tracks, double now, do
             live_.erase(key);
             velState_.erase(key);
             lastLevel_.erase(key);
+            // sampleMark_ is deliberately NOT erased when a contact is dropped.
+            // The underlying RSSI track outlives the contact and still carries
+            // the sample count the transmitter died on. Forgetting that count
+            // here would make the next tick treat the stale track as brand new
+            // and resurrect the contact on every single pass, so the sweep would
+            // fill with blips that never go away all over again. Keeping the
+            // mark means the contact only returns if the count really grows,
+            // i.e. when the transmitter is genuinely transmitting again.
         }
     }
 }
