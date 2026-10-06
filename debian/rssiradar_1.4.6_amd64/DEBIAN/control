@@ -1,5 +1,5 @@
 Package: rssiradar
-Version: 1.4.5
+Version: 1.4.6
 Section: science
 Priority: optional
 Architecture: amd64
@@ -9,7 +9,7 @@ Depends: libc6 (>= 2.38), libgcc-s1 (>= 4.0), libqt6core6t64 (>= 6.4.0),
  libbluetooth3
 Recommends: iw, network-manager
 Suggests: tcpdump
-Installed-Size: 18136
+Installed-Size: 18160
 Section-Description: science
 Description:
  Passive WiFi and Bluetooth radiometric motion sensing.

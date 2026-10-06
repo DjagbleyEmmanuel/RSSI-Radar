@@ -301,6 +301,15 @@ class WifiRadiometricSensor : public ISensor {
     // radiometric frame is parsed; if it goes stale the capture thread tries to
     // recover instead of leaving the UI showing a frozen trace forever.
     std::atomic<uint64_t> lastGoodFrameNs_{0};
+    // Whether any usable frame has been seen since capture started. The watchdog
+    // only arms once this is true: silence before the first frame means the band
+    // is empty, which is not a fault and must not trigger recovery.
+    std::atomic<bool> everSawFrame_{false};
+    // Consecutive recoveries that did not produce frames. Each one lengthens the
+    // wait before the next attempt, and past a point the band is re-swept,
+    // because the usual reason a live band goes quiet is the access point moving
+    // to another channel, and re-pinning the old one cannot help.
+    std::atomic<int> consecutiveFailedRecoveries_{0};
     std::atomic<uint64_t> recoveryCount_{0};
     std::atomic<int> stalled_{0};
     std::string stallReason_;

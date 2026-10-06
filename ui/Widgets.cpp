@@ -1646,30 +1646,94 @@ void TrackingPanelWidget::paintEvent(QPaintEvent*) {
     p.setRenderHint(QPainter::Antialiasing, true);
     p.fillRect(rect(), theme::bg());
 
+    // Every text field this widget draws is recorded, so the layout test can
+    // assert that no two of them overlap. Measured on the drawn geometry, not on
+    // the intent.
+    textRects_.clear();
+    const auto txt = [&p, this](const QRect& r, const QString& t, int align) {
+        textRects_.push_back(QRectF(r));
+        p.drawText(r, align, t);
+    };
+    const auto txtF = [&p, this](const QRectF& r, const QString& t, int align) {
+        textRects_.push_back(r);
+        p.drawText(r, align, t);
+    };
+
     const int w = width();
     const int left = 10;
     const int right = w - 10;
-    // Contacts take two thirds, anomalies the rest; below that width a single
-    // column is more readable than two squeezed ones.
-    const bool split = w > 620;
-    const int listW = split ? static_cast<int>((right - left) * 0.60) : right - left;
-    const int anomX = left + listW + 14;
+
+    // Header bands, explicit and non-overlapping: title, column legend and first
+    // contact row are three separate rows of text. At 14/12/16 px they need
+    // y = 2, 16 and 34 to leave a gap between each. They used to sit at 4, 18 and
+    // 28, which put the legend across the bottom of the title and across the top
+    // of the first contact.
+    constexpr int kHeaderH = 14;
+    constexpr int kLegendH = 12;
+    constexpr int kFirstRowY = 34 + kHeaderH;
+
+    // Two panels side by side when there is room, one above the other when there
+    // is not.
+    //
+    // Previously the signal analysis was simply not drawn at all below 620 px, so
+    // resizing the window narrower made most of the panel's information vanish
+    // with no indication that it was a layout decision rather than missing data.
+    // It is now stacked underneath instead.
+    const bool split = w > 700;
+
+    // The contact row used to place its fields at fixed offsets -- name at +42,
+    // range at +162, speed at +314, presence at +388, state at +448, age at +512 --
+    // which needs 602 px. The contacts column is only 60% of the panel, so on any
+    // ordinary width the tail of the row was drawn straight through the signal
+    // analysis beside it, and state overlapped the age field by 6 px even when the
+    // panel was wide enough. Fields are now laid out as measured bands inside the
+    // column they belong to, elided to their own band and dropped when they do not
+    // fit, so nothing can ever overlap anything else.
+    int listW, anomX, anomY, anomH;
+    if (split) {
+        listW = static_cast<int>((right - left) * 0.58);
+        anomX = left + listW + 16;
+        anomY = 0;
+        anomH = height();
+    } else {
+        listW = right - left;
+        anomX = left;
+        anomY = std::min(height() / 2,
+                       kFirstRowY + 19 * static_cast<int>(snap_.contacts.size()) + 24);
+        anomH = height() - anomY;
+    }
 
     p.setFont(QFont(font().family(), 8, QFont::Bold));
     p.setPen(theme::cyan());
-    p.drawText(QPoint(left, 14), QStringLiteral("CONTACTS"));
+    p.setFont(QFont(font().family(), 8, QFont::Bold));
+    p.setPen(theme::cyan());
+    txt(QRect(left, 2, listW, kHeaderH), QStringLiteral("CONTACTS"),
+        Qt::AlignLeft | Qt::AlignVCenter);
     p.setFont(font());
     p.setPen(QColor(88, 122, 134));
-    p.drawText(QPoint(left, 26), QStringLiteral("id · source · range · speed · presence"));
+    txt(QRect(left, 2 + kHeaderH, listW, kLegendH),
+        QStringLiteral("id · source · range · speed · presence"),
+        Qt::AlignLeft | Qt::AlignVCenter);
 
     if (snap_.contacts.empty()) {
         p.setFont(QFont(font().family(), 10));
         p.setPen(theme::textDim());
-        p.drawText(QRect(left, 30, listW, 22), Qt::AlignCenter | Qt::AlignVCenter,
-                   QStringLiteral("NO TARGET"));
+        txt(QRect(left, kFirstRowY, listW, 22), QStringLiteral("NO TARGET"),
+            Qt::AlignCenter | Qt::AlignVCenter);
         p.setFont(font());
     } else {
-        int y = 40;
+        const QFontMetrics fm(font());
+        const int rowH = 19;
+
+        // Field widths, in priority order. Name and range are what the row is
+        // for, so they keep their space longest; the rest give way first.
+        const int idW = 26;
+        const int barW = 46;
+        const int stateW = 52;
+        const int ageW = 46;
+        const int speedW = 62;
+
+        int y = kFirstRowY + 12;
         for (const auto& c : snap_.contacts) {
             if (y > height() - 8) break;
             const QColor base = theme::forMac(macHash(c.mac));
@@ -1678,38 +1742,60 @@ void TrackingPanelWidget::paintEvent(QPaintEvent*) {
             p.setPen(QPen(base, 2));
             p.drawLine(left, y - 4, left + 8, y - 4);
 
-            p.setPen(QColor(96, 255, 168, alpha));
-            p.drawText(QRectF(left + 14, y - 12, 26, 16), Qt::AlignLeft | Qt::AlignVCenter,
-                       QStringLiteral("#%1").arg(c.id));
+            // Walk the row from the left, consuming measured bands.
+            int x = left + 14;
+            const auto field = [&](int wdt, const QString& text, const QColor& col) {
+                p.setPen(col);
+                txtF(QRectF(x, y - 12, wdt, 16), fm.elidedText(text, Qt::ElideRight, wdt),
+                     Qt::AlignLeft | Qt::AlignVCenter);
+                x += wdt + 6;
+                return x;
+            };
 
-            p.setPen(QColor(210, 232, 240, alpha));
-            QString name = QString::fromStdString(c.label);
-            name = name.length() > 16 ? name.left(15) + QChar(0x2026) : name;
-            p.drawText(QRectF(left + 42, y - 12, 120, 16), Qt::AlignLeft | Qt::AlignVCenter, name);
+            // Width still free before the presence bar, so a field is only drawn
+            // if it fits in full.
+            const int remaining = left + listW - (barW + 14) - x;
 
-            // Range with the interval shadowing implies. A bare number here
-            // would overstate the precision by a factor of about two.
-            if (c.rangeValid) {
-                p.setPen(QColor(180, 206, 216, alpha));
-                p.drawText(QRectF(left + 162, y - 12, 150, 16),
-                           Qt::AlignLeft | Qt::AlignVCenter,
-                           QStringLiteral("%1 m  [%2-%3]")
-                               .arg(c.rangeM, 0, 'f', 1)
-                               .arg(c.rangeLoM, 0, 'f', 1)
-                               .arg(c.rangeHiM, 0, 'f', 1));
-            } else {
-                p.setPen(QColor(94, 132, 150, alpha));
-                p.drawText(QRectF(left + 162, y - 12, 150, 16), Qt::AlignLeft | Qt::AlignVCenter,
-                           QStringLiteral("range n/a"));
-            }
+            field(idW, QStringLiteral("#%1").arg(c.id), QColor(96, 255, 168, alpha));
 
-            p.setPen(QColor(150, 180, 192, alpha));
-            p.drawText(QRectF(left + 314, y - 12, 70, 16), Qt::AlignLeft | Qt::AlignVCenter,
-                       c.velocityValid ? QStringLiteral("%1 m/s").arg(c.velocityMps, 0, 'f', 3)
-                                       : QStringLiteral("--"));
+            // Source name takes whatever is left after the other columns, so it
+            // is drawn last and can be the elided one.
+            int reserved = 0;
+            if (remaining > 200) reserved += speedW + 6;
+            if (remaining > 260) reserved += stateW + 6;
+            if (remaining > 320 && c.silenceSeconds > 0.2) reserved += ageW + 6;
+            const int nameW = std::max(40, left + listW - (barW + 14) - x - reserved);
+            field(nameW, QString::fromStdString(c.label), QColor(210, 232, 240, alpha));
 
-            // Presence bar: the visual that makes a fading contact obvious.
-            const QRectF bar(left + 388, y - 9, 54, 6);
+            const QString rangeText =
+                c.rangeValid ? QStringLiteral("%1 m  [%2-%3]")
+                                   .arg(c.rangeM, 0, 'f', 1)
+                                   .arg(c.rangeLoM, 0, 'f', 1)
+                                   .arg(c.rangeHiM, 0, 'f', 1)
+                               : QStringLiteral("range n/a");
+            const int rangeW = std::min(150, std::max(60, left + listW - (barW + 14) - x));
+            p.setPen(c.rangeValid ? QColor(180, 206, 216, alpha) : QColor(94, 132, 150, alpha));
+            txtF(QRectF(x, y - 12, rangeW, 16), fm.elidedText(rangeText, Qt::ElideRight, rangeW),
+                 Qt::AlignLeft | Qt::AlignVCenter);
+            x += rangeW + 6;
+
+            if (left + listW - (barW + 14) - x >= speedW)
+                field(speedW, c.velocityValid
+                                  ? QStringLiteral("%1 m/s").arg(c.velocityMps, 0, 'f', 3)
+                                  : QStringLiteral("--"),
+                      QColor(150, 180, 192, alpha));
+
+            if (left + listW - (barW + 14) - x >= stateW)
+                field(stateW, toString(c.state),
+                      c.state == ContactState::Active ? theme::green() : theme::amber());
+
+            if (c.silenceSeconds > 0.2 && left + listW - (barW + 14) - x >= ageW)
+                field(ageW, QStringLiteral("-%1s").arg(c.silenceSeconds, 0, 'f', 1),
+                      QColor(94, 132, 150, alpha));
+
+            // Presence bar, right-aligned in the column so it lines up down the
+            // panel whatever the other fields did.
+            const QRectF bar(left + listW - barW, y - 9, barW, 6);
             p.setPen(Qt::NoPen);
             p.setBrush(QColor(22, 36, 43));
             p.drawRoundedRect(bar, 3, 3);
@@ -1717,59 +1803,56 @@ void TrackingPanelWidget::paintEvent(QPaintEvent*) {
             p.drawRoundedRect(QRectF(bar.left(), bar.top(), bar.width() * c.presence, bar.height()),
                               3, 3);
 
-            p.setPen(c.state == ContactState::Active ? theme::green()
-                                                      : theme::amber());
-            p.drawText(QRectF(left + 448, y - 12, 70, 16), Qt::AlignLeft | Qt::AlignVCenter,
-                       toString(c.state));
-
-            if (c.silenceSeconds > 0.2) {
-                p.setPen(QColor(94, 132, 150, alpha));
-                p.drawText(QRectF(left + 512, y - 12, 90, 16), Qt::AlignLeft | Qt::AlignVCenter,
-                           QStringLiteral("-%1s").arg(c.silenceSeconds, 0, 'f', 1));
-            }
-            y += 19;
+            y += rowH;
         }
     }
 
-    if (!split) return;
+    if (anomH < 40) return;   // genuinely no room for a second panel
 
-    // --- anomaly panel
+    // --- signal analysis
+    const int avail0 = right - anomX;
     p.setFont(QFont(font().family(), 8, QFont::Bold));
     p.setPen(theme::violet());
-    p.drawText(QPoint(anomX, 14), QStringLiteral("SIGNAL ANALYSIS"));
+    txt(QRect(anomX, anomY + 2, avail0, kHeaderH), QStringLiteral("SIGNAL ANALYSIS"),
+        Qt::AlignLeft | Qt::AlignVCenter);
     p.setFont(font());
 
+    const int avail = right - anomX;
     const AnomalyReport& a = snap_.anomaly;
     if (!a.enoughData) {
         p.setPen(theme::textDim());
-        p.drawText(QRect(anomX, 24, right - anomX, 40),
-                   Qt::AlignLeft | Qt::AlignVCenter,
-                   QStringLiteral("%1/%2 samples\nneed more data")
-                       .arg(a.samples)
-                       .arg(size_t(48)));
+        txt(QRect(anomX, anomY + 10 + kHeaderH, avail, 40),
+            QStringLiteral("%1/48 samples\nneed more data").arg(a.samples),
+            Qt::AlignLeft | Qt::AlignVCenter);
         return;
     }
 
-    int y = 28;
-    const int avail = right - anomX;
-    p.setFont(QFont(font().family(), 8));
+    // The key column takes a third, capped, and the value column takes the rest.
+    // It was a flat 70 px with the value drawn at anomX + 70 and given
+    // avail - 70, which goes negative on a narrow panel and let the two overlap.
+    const int keyW = std::clamp(avail / 3, 46, 78);
+
+    int y = anomY + 10 + kHeaderH;
     struct Row { QString k; QString v; };
     const std::vector<Row> rows = {
-        {QStringLiteral("mean"), QStringLiteral("%1 dBm  ±%2").arg(a.meanDbm, 0, 'f', 1).arg(a.stdDbm, 0, 'f', 2)},
+        {QStringLiteral("mean"),
+         QStringLiteral("%1 dBm  ±%2").arg(a.meanDbm, 0, 'f', 1).arg(a.stdDbm, 0, 'f', 2)},
         {QStringLiteral("volatility"), QStringLiteral("%1").arg(a.varianceRatio, 0, 'f', 2)},
         {QStringLiteral("flatness"), QStringLiteral("%1").arg(a.spectralFlatness, 0, 'f', 3)},
         {QStringLiteral("entropy"), QStringLiteral("%1 / 1").arg(a.shannonEntropyBits, 0, 'f', 2)},
         {QStringLiteral("period"), a.dominantPeriodS > 0.0
-                                   ? QStringLiteral("%1 s").arg(a.dominantPeriodS, 0, 'f', 2)
-                                   : QStringLiteral("none")},
+                                       ? QStringLiteral("%1 s").arg(a.dominantPeriodS, 0, 'f', 2)
+                                       : QStringLiteral("none")},
         {QStringLiteral("kurtosis"), QStringLiteral("%1").arg(a.kurtosis, 0, 'f', 2)},
         {QStringLiteral("trend"), QStringLiteral("%1 dB/min").arg(a.trendPerMinute, 0, 'f', 2)},
     };
     for (const auto& r : rows) {
         p.setPen(QColor(94, 132, 150));
-        p.drawText(QRectF(anomX, y, 70, 14), Qt::AlignLeft | Qt::AlignVCenter, r.k);
+        txtF(QRectF(anomX, y, keyW, 14), r.k, Qt::AlignLeft | Qt::AlignVCenter);
         p.setPen(QColor(200, 224, 234));
-        p.drawText(QRectF(anomX + 70, y, avail - 70, 14), Qt::AlignLeft | Qt::AlignVCenter, r.v);
+        txtF(QRectF(anomX + keyW + 6, y, avail - keyW - 6, 14),
+             QFontMetrics(font()).elidedText(r.v, Qt::ElideRight, avail - keyW - 6),
+             Qt::AlignLeft | Qt::AlignVCenter);
         y += 14;
     }
 
@@ -1778,25 +1861,28 @@ void TrackingPanelWidget::paintEvent(QPaintEvent*) {
     int shown = 0;
     for (const auto& an : a.anomalies) {
         if (!an.active || shown >= 2) break;
-        if (y > height() - 26) break;
+        if (y > anomY + anomH - 26) break;
         p.setPen(theme::violet());
-        p.drawText(QRectF(anomX, y, avail, 14), Qt::AlignLeft | Qt::AlignVCenter,
-                   QStringLiteral("%1  %2")
-                       .arg(QString::fromLatin1(toString(an.kind)))
-                       .arg(QString::fromStdString(an.headline)));
+        txtF(QRectF(anomX, y, avail, 14),
+             QFontMetrics(font()).elidedText(
+                 QStringLiteral("%1  %2")
+                     .arg(QString::fromLatin1(toString(an.kind)))
+                     .arg(QString::fromStdString(an.headline)),
+                 Qt::ElideRight, avail),
+             Qt::AlignLeft | Qt::AlignVCenter);
         y += 13;
         p.setPen(QColor(120, 150, 164));
-        // Elide rather than let the explanation run off the panel.
-        QFontMetrics fm(p.font());
-        p.drawText(QRectF(anomX, y, avail, 13), Qt::AlignLeft | Qt::AlignVCenter,
-                   fm.elidedText(QString::fromStdString(an.detail), Qt::ElideRight, avail));
+        txtF(QRectF(anomX, y, avail, 13),
+             QFontMetrics(font()).elidedText(QString::fromStdString(an.detail),
+                                             Qt::ElideRight, avail),
+             Qt::AlignLeft | Qt::AlignVCenter);
         y += 15;
         ++shown;
     }
-    if (shown == 0) {
+    if (shown == 0 && y < anomY + anomH - 14) {
         p.setPen(QColor(94, 132, 150));
-        p.drawText(QRect(anomX, y, avail, 14), Qt::AlignLeft | Qt::AlignVCenter,
-                   QStringLiteral("nothing anomalous"));
+        txt(QRect(anomX, y, avail, 14), QStringLiteral("nothing anomalous"),
+            Qt::AlignLeft | Qt::AlignVCenter);
     }
 }
 

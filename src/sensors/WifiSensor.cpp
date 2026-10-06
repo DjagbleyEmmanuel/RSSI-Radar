@@ -45,8 +45,26 @@ constexpr uint8_t kIftypeManaged = 2;
 // How long the capture may produce nothing usable before the watchdog decides
 // something has gone wrong and tries to fix it. Deliberately generous: a quiet
 // band is not a fault, and recovering needlessly would itself cause churn.
-constexpr std::chrono::seconds kStallTimeout{8};
-constexpr uint64_t kStallTimeoutNs = 8000000000ULL;
+// Silence is normal, not a fault.
+//
+// This was eight seconds, which is short enough that an access point which
+// stopped beaconing for a moment, or which the user was connected to while it
+// roamed, was treated as a broken capture. Recovery then tore down and rebuilt
+// the socket and the monitor-mode interface on a fixed eight-second cycle,
+// indefinitely, for as long as the band stayed quiet -- which is what made it
+// feel like the application kept dropping out of sensing on its own.
+//
+// A 2.4 GHz band can genuinely be empty for minutes. The watchdog only exists to
+// catch a capture that has stopped delivering after it had been delivering, and
+// it backs off geometrically when a recovery does not help, so a quiet band costs
+// one lookup rather than constant churn.
+constexpr std::chrono::seconds kStallTimeout{25};
+constexpr uint64_t kStallTimeoutNs = 25000000000ULL;
+// 25 s, then 50 s, 100 s, 200 s, and no further than this.
+constexpr std::chrono::seconds kStallBackoffMax{300};
+// After this many fruitless recoveries, the access point has almost certainly
+// moved channel, so re-sweep for it rather than re-pinning where it used to be.
+constexpr int kResweepAfterFailures = 3;
 
 uint64_t nowNs() {
     return static_cast<uint64_t>(
@@ -1290,16 +1308,33 @@ void WifiRadiometricSensor::captureLoop() {
     // A quiet period alone is not proof of a fault (a genuinely empty band is
     // quiet too), so recovery is attempted on a timer and is idempotent.
     auto lastRecovery = Clock::now();
+    auto kStallInterval = kStallTimeout;
+    everSawFrame_.store(false, std::memory_order_relaxed);
+    consecutiveFailedRecoveries_.store(0, std::memory_order_relaxed);
     lastGoodFrameNs_.store(nowNs(), std::memory_order_relaxed);
 
     while (active_.load(std::memory_order_relaxed)) {
         // Checked on the EAGAIN path below as well, so it fires even when the
         // socket is returning megabytes of unusable frames.
-        if (Clock::now() - lastRecovery > kStallTimeout) {
+        //
+        // Armed only once a usable frame has actually been seen, and the interval
+        // grows while recoveries keep failing, so a legitimately quiet band is
+        // left alone instead of being torn down and rebuilt on a fixed cycle.
+        if (Clock::now() - lastRecovery > kStallInterval) {
             lastRecovery = Clock::now();
             const uint64_t quietNs = nowNs() - lastGoodFrameNs_.load(std::memory_order_relaxed);
-            if (quietNs > kStallTimeoutNs) {
+            if (quietNs > kStallTimeoutNs && everSawFrame_.load(std::memory_order_relaxed)) {
                 attemptRecovery();
+                // If that produced nothing, lengthen the wait before trying again,
+                // up to a ceiling. A band that stays quiet is left alone rather
+                // than being taken apart every twenty-five seconds.
+                if (nowNs() - lastGoodFrameNs_.load(std::memory_order_relaxed) >
+                    kStallTimeoutNs) {
+                    consecutiveFailedRecoveries_.fetch_add(1, std::memory_order_relaxed);
+                    kStallInterval = std::min(kStallInterval * 2, kStallBackoffMax);
+                    note("no frames after recovery; next attempt in " +
+                         std::to_string(static_cast<int>(kStallInterval.count())) + "s");
+                }
                 continue;
             }
         }
@@ -1402,6 +1437,18 @@ void WifiRadiometricSensor::captureLoop() {
             // Any usable frame proves the capture is alive, so this is what
             // clears the stall flag and resets the watchdog.
             lastGoodFrameNs_.store(nowNs(), std::memory_order_relaxed);
+            if (!everSawFrame_.exchange(true, std::memory_order_relaxed))
+                note("watchdog armed after first usable frame");
+            // Frames are flowing again, so whatever went wrong has either fixed
+            // itself or been fixed. Clear the failure count and return to the base
+            // interval -- otherwise a successful recovery would still leave the
+            // count climbing, and the band would eventually be re-swept for no
+            // reason.
+            if (consecutiveFailedRecoveries_.exchange(0, std::memory_order_relaxed) != 0 ||
+                kStallInterval != kStallTimeout) {
+                consecutiveFailedRecoveries_.store(0, std::memory_order_relaxed);
+                kStallInterval = kStallTimeout;
+            }
             stalled_.store(0, std::memory_order_relaxed);
             push(obs);
         }
@@ -1907,6 +1954,27 @@ bool WifiRadiometricSensor::attemptRecovery() {
     }
     stalled_.store(1, std::memory_order_relaxed);
     note("capture went quiet; attempting recovery");
+
+    // If nothing has come back after several attempts, the access point has most
+    // likely moved to another channel. Re-pinning, reopening the socket and
+    // re-entering monitor mode all leave us listening to the same empty frequency,
+    // so repeating them cannot help and just churns the interface. Sweep for the
+    // access point instead, which is the one action that can follow it.
+    //
+    // This runs from the capture thread, which is what the sweep needs.
+    if (consecutiveFailedRecoveries_.load(std::memory_order_relaxed) >= kResweepAfterFailures) {
+        consecutiveFailedRecoveries_.store(0, std::memory_order_relaxed);
+        std::string sweep;
+        note("re-sweeping the band: the access point has probably moved channel");
+        const int found = sweepBand(400, &sweep);
+        if (found > 0 && found != autoChannel_) {
+            autoChannel_ = found;
+            if (monitorMode_) repinChannel();
+        }
+        note(sweep);
+        lastGoodFrameNs_.store(nowNs(), std::memory_order_relaxed);
+        return found > 0;
+    }
 
     // Step 1, the common case: the access point roamed and the synthesiser is
     // still on the old channel.

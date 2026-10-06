@@ -259,13 +259,32 @@ class TrackTableWidget : public QWidget {
 class TrackingPanelWidget : public QWidget {
     Q_OBJECT
   public:
+    // Test hook: number of pairs of text fields whose drawn rectangles overlap.
+    //
+    // The contacts row used to place its fields at fixed offsets that needed 602
+    // px while the column was only 58% of the panel, so the tail of the row was
+    // drawn through the signal analysis beside it. The rectangles are recorded as
+    // they are painted, so this measures what the operator actually sees rather
+    // than what the layout code intended.
+    const std::vector<QRectF>& textRects() const { return textRects_; }
+    int textOverlaps() const {
+        int n = 0;
+        for (size_t i = 0; i < textRects_.size(); ++i)
+            for (size_t j = i + 1; j < textRects_.size(); ++j)
+                if (textRects_[i].intersects(textRects_[j])) ++n;
+        return n;
+    }
+
     explicit TrackingPanelWidget(QWidget* parent = nullptr);
     void setSnapshot(const Snapshot& s);
 
   protected:
     void paintEvent(QPaintEvent*) override;
 
+      std::vector<QRectF> textRects_;
+
   private:
+private:
     Snapshot snap_;
 };
 
